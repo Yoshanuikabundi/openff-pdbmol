@@ -10,8 +10,8 @@ import dataclasses
 from urllib.request import urlopen
 
 from openff.toolkit import Molecule, Topology
-from openff.toolkit.topology import Bond
-from openff.units import elements
+from openff.toolkit.topology import Atom, Bond
+from openff.units import elements, unit
 from openmm.app.internal.pdbx.reader.PdbxReader import PdbxReader
 
 
@@ -349,18 +349,15 @@ class CcdCache(dict[str, CcdResidueDefinition]):
         return super().__setitem__(key.upper(), val)
 
     def update(self, *args, **kwargs):
-        print("update", args, kwargs)
         for k, v in dict(*args, **kwargs).items():
             self[k] = v
 
     def _download_cif(self, resname: str) -> str:
-        print(f"Downloading {resname}...")
         with urlopen(
             f"https://files.rcsb.org/ligands/download/{resname.upper()}.cif",
         ) as stream:
             s = stream.read().decode("utf-8")
         path = self.path / f"{resname.upper()}.cif"
-        print("writing to", path)
         path.write_text(s)
         return s
 
@@ -417,6 +414,27 @@ LINKING_TYPES: dict[str, CcdBondDefinition | None] = {
 }
 
 
+def identify_linkers(
+    molecule: Molecule, linked_atomname: str
+) -> tuple[int, Atom, set[Atom]]:
+    possible_partners = [
+        (i, atom)
+        for i, atom in enumerate(molecule.atoms)
+        if atom.name == linked_atomname
+    ]
+    for partner, partner_atom in possible_partners:
+        leavers = set()
+        candidates = set(partner_atom.bonded_atoms)
+        while candidates:
+            candidate = candidates.pop()
+            if candidate.metadata.get("leaving", False):
+                leavers.add(candidate)
+                candidates.update(set(candidate.bonded_atoms) - leavers)
+        if leavers:
+            return (partner, partner_atom, leavers)
+    raise ValueError("No partners found")
+
+
 def combine_molecules(this: Molecule, other: Molecule):
     """
     Combine molecules by unifying leaving atoms with the opposite molecule
@@ -448,41 +466,12 @@ def combine_molecules(this: Molecule, other: Molecule):
         raise ValueError(f"Linking type {other_linking_type} does not form linkages")
 
     # Identify the atoms participating in the bond and those leaving
-    possible_partners = [
-        (i, atom)
-        for i, atom in enumerate(this.atoms)
-        if atom.name == linking_bond.atom1
-    ]
-    for this_partner, this_partner_atom in possible_partners:
-        this_leavers = set()
-        candidates = set(this_partner_atom.bonded_atoms)
-        while candidates:
-            candidate = candidates.pop()
-            if candidate.metadata.get("leaving", False):
-                this_leavers.add(candidate)
-                candidates.update(set(candidate.bonded_atoms) - this_leavers)
-        if this_leavers:
-            break
-    else:
-        raise ValueError("No partners found")
-
-    possible_partners = [
-        (i, atom)
-        for i, atom in enumerate(other.atoms)
-        if atom.name == linking_bond.atom2
-    ]
-    for other_partner, other_partner_atom in possible_partners:
-        other_leavers = set()
-        candidates = set(other_partner_atom.bonded_atoms)
-        while candidates:
-            candidate = candidates.pop()
-            if candidate.metadata.get("leaving", False):
-                other_leavers.add(candidate)
-                candidates.update(set(candidate.bonded_atoms) - other_leavers)
-        if other_leavers:
-            break
-    else:
-        raise ValueError("No partners found")
+    this_partner, this_partner_atom, this_leavers = identify_linkers(
+        this, linking_bond.atom1
+    )
+    other_partner, other_partner_atom, other_leavers = identify_linkers(
+        other, linking_bond.atom2
+    )
 
     # Add atoms
     combined = Molecule()
@@ -493,13 +482,14 @@ def combine_molecules(this: Molecule, other: Molecule):
         if atom in this_leavers:
             continue
 
-        this_to_combined[i] = combined.add_atom(
+        this_to_combined[i] = combined._add_atom(
             atomic_number=atom.atomic_number,
             formal_charge=atom.formal_charge,
             is_aromatic=atom.is_aromatic,
             stereochemistry=atom.stereochemistry,
             name=atom.name,
             metadata=atom.metadata | {"leaving": False},
+            invalidate_cache=False,
         )
 
     other_to_combined = {}
@@ -507,13 +497,14 @@ def combine_molecules(this: Molecule, other: Molecule):
         if atom in other_leavers:
             continue
 
-        other_to_combined[i] = combined.add_atom(
+        other_to_combined[i] = combined._add_atom(
             atomic_number=atom.atomic_number,
             formal_charge=atom.formal_charge,
             is_aromatic=atom.is_aromatic,
             stereochemistry=atom.stereochemistry,
             name=atom.name,
             metadata=atom.metadata,
+            invalidate_cache=False,
         )
 
     # Add bonds
@@ -521,24 +512,26 @@ def combine_molecules(this: Molecule, other: Molecule):
         if bond.atom1 in this_leavers or bond.atom2 in this_leavers:
             continue
 
-        combined.add_bond(
+        combined._add_bond(
             atom1=this_to_combined[bond.atom1_index],
             atom2=this_to_combined[bond.atom2_index],
             bond_order=bond.bond_order,
             is_aromatic=bond.is_aromatic,
             stereochemistry=bond.stereochemistry,
+            invalidate_cache=False,
         )
 
     for bond in other.bonds:
         if bond.atom1 in other_leavers or bond.atom2 in other_leavers:
             continue
 
-        combined.add_bond(
+        combined._add_bond(
             atom1=other_to_combined[bond.atom1_index],
             atom2=other_to_combined[bond.atom2_index],
             bond_order=bond.bond_order,
             is_aromatic=bond.is_aromatic,
             stereochemistry=bond.stereochemistry,
+            invalidate_cache=False,
         )
 
     combined.add_bond(
@@ -571,13 +564,33 @@ def topology_from_pdb(path: PathLike) -> Topology:
         res_name = data.res_name[prototype_index]
         residue = CCD_RESIDUE_DEFINITION_CACHE.get_resname(res_name).to_molecule()
 
+        atom_names_to_indices = {data.name[i]: i for i in res_atom_idcs}
+        ccd_residue_atom_names = {atom.name for atom in residue.atoms}
+
         residue_wide_metadata = {
             "residue_number": data.res_seq[prototype_index],
             "insertion_code": data.i_code[prototype_index],
             "chain_id": data.chain_id[prototype_index],
         }
         for atom in residue.atoms:
-            atom.metadata.update(residue_wide_metadata)
+            if atom.name not in ccd_residue_atom_names:
+                raise ValueError(
+                    "Atom {atom.name} in PDB file not present in residue {res_name}"
+                )
+
+            if atom.name in atom_names_to_indices:
+                pdb_index = atom_names_to_indices[atom.name]
+                x = data.x[pdb_index]
+                y = data.y[pdb_index]
+                z = data.z[pdb_index]
+                atom_specific_metadata = {
+                    "pdb_index": pdb_index,
+                    "pdb_coords": f"{x} {y} {z}",
+                }
+            else:
+                atom_specific_metadata = {}
+
+            atom.metadata.update(residue_wide_metadata | atom_specific_metadata)
 
         current_molecule = combine_molecules(current_molecule, residue)
 
@@ -590,13 +603,30 @@ def topology_from_pdb(path: PathLike) -> Topology:
             molecules.append(current_molecule)
             current_molecule = Molecule()
 
-        # TODO: Raise an error if atoms from the PDB file do not appear in the CCD entry
-        # TODO: Mark atoms missing from the PDB file somehow
-        # TODO: Load coordinates from PDB file
         # TODO: Load other data from PDB file
-        # TODO: Generate coordinates for atoms missing from PDB file
+        # TODO: Incorporate CONECT records
+        # TODO: Deal with multi-model files
 
         prev_chain_id = data.chain_id[prototype_index]
         prev_model = data.model[prototype_index]
 
-    return Topology.from_molecules(molecules)
+    topology = Topology.from_molecules(molecules)
+
+    positions = []
+    for atom in topology.atoms:
+        if "pdb_coords" in atom.metadata:
+            coords = atom.metadata["pdb_coords"]
+        else:
+            # TODO: Generate coordinates for atoms missing from PDB file
+            coords = next(
+                (
+                    atom.metadata["pdb_coords"]
+                    for atom in atom.bonded_atoms
+                    if "pdb_coords" in atom.metadata
+                ),
+                "0 0 0",
+            )
+        positions.append([float(s) for s in coords.split()])
+    topology.set_positions(positions * unit.angstrom)
+
+    return topology
