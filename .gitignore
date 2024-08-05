@@ -71,6 +71,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+.virtual_documents
 
 # pyenv
 .python-version
@@ -108,3 +109,5 @@ ENV/
 
 # poetry
 poetry.lock
+
+.ccd_cache
