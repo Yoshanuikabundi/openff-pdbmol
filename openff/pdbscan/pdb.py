@@ -68,8 +68,17 @@ class PDBMolecule:
             if bond.atom2 == index:
                 yield bond.atom1
 
+    def are_bonded(self, atom1: int, atom2: int) -> bool:
+        for bond in self.bonds:
+            if (
+                (bond.atom1 == atom1 and bond.atom2 == atom2)
+                or (bond.atom1 == atom2 and bond.atom2 == atom1)
+            ):
+                return True
+        return False
+
     def is_empty(self) -> bool:
-        return len(self.atoms) == 0 and len(self.bonds) == 0 and len(self.properties) == 0
+        return self.n_atoms == 0 and self.n_bonds == 0 and len(self.properties) == 0
 
     @property
     def n_atoms(self) -> int:
@@ -79,6 +88,13 @@ class PDBMolecule:
     def n_bonds(self) -> int:
         return len(self.bonds)
 
+    def get_bond_network(self) -> dict[int, set[int]]:
+        network: dict[int, set[int]] = {}
+        for bond in self.bonds:
+            network.setdefault(bond.atom1, set()).add(bond.atom2)
+            network.setdefault(bond.atom2, set()).add(bond.atom1)
+        return network
+
     def identify_linkers(
         self, linked_atomname: str
     ) -> tuple[int, PDBAtom, set[int]]:
@@ -87,15 +103,16 @@ class PDBMolecule:
             for i, atom in enumerate(self.atoms)
             if atom.name == linked_atomname
         ]
+        bond_network = self.get_bond_network()
         for partner, partner_atom in possible_partners:
             leavers = set()
-            candidates = set(self.atoms_bonded_to(partner))
+            candidates = set(bond_network[partner])
             while candidates:
                 candidate = candidates.pop()
                 candidate_atom = self.atoms[candidate]
                 if candidate_atom.metadata.get("leaving", False):
                     leavers.add(candidate)
-                    candidates.update(set(self.atoms_bonded_to(candidate)) - leavers)
+                    candidates.update(bond_network[candidate] - leavers)
             if leavers:
                 return (partner, partner_atom, leavers)
         raise ValueError("No partners found")
