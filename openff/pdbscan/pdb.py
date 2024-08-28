@@ -1,20 +1,27 @@
+import dataclasses
 from collections.abc import Mapping
 from copy import deepcopy
-from io import StringIO
-from itertools import chain
-from os import PathLike
-from time import sleep
-from typing import Any, Generator, Iterable, Self, Literal, Iterator, TypeVar
-from pathlib import Path
 from dataclasses import dataclass, field
-import dataclasses
+from io import StringIO
+from os import PathLike
+from pathlib import Path
+from typing import (
+    Any,
+    Generator,
+    Iterable,
+    Iterator,
+    Literal,
+    Self,
+    TypeVar,
+)
 from urllib.request import urlopen
 
-from openff.toolkit import Molecule, Topology
-from openff.toolkit.topology import Atom, Bond
-from openff.units import elements, unit
-from openmm.app.internal.pdbx.reader.PdbxReader import PdbxReader
 import numpy as np
+from networkx import Graph
+from openmm.app.internal.pdbx.reader.PdbxReader import PdbxReader
+
+from openff.toolkit import Molecule, Topology
+from openff.units import elements, unit
 
 
 class __UNSET__:
@@ -25,7 +32,7 @@ class __UNSET__:
 class PDBAtom:
     atomic_number: int
     formal_charge: int
-    is_aromatic: bool
+    is_aromatic: bool | None
     stereochemistry: Literal["S", "R", None]
     name: str
     x: float | None = None
@@ -39,6 +46,7 @@ class PDBAtom:
             return None
         else:
             return (self.x, self.y, self.z)
+
 
 @dataclass
 class PDBBond:
@@ -70,9 +78,8 @@ class PDBMolecule:
 
     def are_bonded(self, atom1: int, atom2: int) -> bool:
         for bond in self.bonds:
-            if (
-                (bond.atom1 == atom1 and bond.atom2 == atom2)
-                or (bond.atom1 == atom2 and bond.atom2 == atom1)
+            if (bond.atom1 == atom1 and bond.atom2 == atom2) or (
+                bond.atom1 == atom2 and bond.atom2 == atom1
             ):
                 return True
         return False
@@ -95,9 +102,7 @@ class PDBMolecule:
             network.setdefault(bond.atom2, set()).add(bond.atom1)
         return network
 
-    def identify_linkers(
-        self, linked_atomname: str
-    ) -> tuple[int, PDBAtom, set[int]]:
+    def identify_linkers(self, linked_atomname: str) -> tuple[int, PDBAtom, set[int]]:
         possible_partners = [
             (i, atom)
             for i, atom in enumerate(self.atoms)
@@ -124,18 +129,18 @@ class PDBMolecule:
 
         for atom in self.atoms:
             molecule._add_atom(
-                atomic_number = atom.atomic_number,
-                formal_charge= atom.formal_charge,
-                is_aromatic= atom.is_aromatic,
+                atomic_number=atom.atomic_number,
+                formal_charge=atom.formal_charge,
+                is_aromatic=atom.is_aromatic,
                 stereochemistry=atom.stereochemistry,
-                name = atom.name,
-                metadata = atom.metadata,
-                invalidate_cache=False
+                name=atom.name,
+                metadata=atom.metadata,
+                invalidate_cache=False,
             )
 
             if atom.coords is None:
                 # TODO: Come up with something clever here
-                conformer.append((0., 0., 0.))
+                conformer.append((0.0, 0.0, 0.0))
             else:
                 conformer.append(atom.coords)
 
@@ -143,16 +148,19 @@ class PDBMolecule:
             molecule._add_bond(
                 atom1=bond.atom1,
                 atom2=bond.atom2,
-                bond_order = bond.bond_order,
+                bond_order=bond.bond_order,
                 is_aromatic=bond.is_aromatic,
                 stereochemistry=bond.stereochemistry,
-                invalidate_cache=False
+                invalidate_cache=False,
             )
 
         molecule._invalidate_cached_properties()
 
         molecule.add_conformer(np.asarray(conformer) * unit.angstrom)
         return molecule
+
+    def to_networkx(self) -> Graph:
+        return self.to_openff_molecule().to_networkx()
 
     def combine_with(self, other: "PDBMolecule"):
         """
@@ -176,13 +184,14 @@ class PDBMolecule:
         if other_linking_type not in LINKING_TYPES:
             raise ValueError(f"Unknown linking type {other_linking_type}")
 
-
         self_linking_bond = LINKING_TYPES[self_linking_type]
         other_linking_bond = LINKING_TYPES[other_linking_type]
         if self_linking_bond is None:
             raise ValueError(f"Linking type {self_linking_type} does not form linkages")
         if other_linking_bond is None:
-            raise ValueError(f"Linking type {self_linking_type} does not form linkages")
+            raise ValueError(
+                f"Linking type {other_linking_type} does not form linkages"
+            )
         if self_linking_bond != other_linking_bond:
             raise ValueError(
                 f"Molecule of linking type {self_linking_type} cannot be linked to"
@@ -227,26 +236,31 @@ class PDBMolecule:
                 bond.atom1 = self_to_combined[bond.atom1]
                 bond.atom2 = self_to_combined[bond.atom2]
 
-
-        self.add_bond(PDBBond(
-            atom1=self_to_combined[this_partner],
-            atom2=other_to_combined[other_partner],
-            bond_order={"SING": 1, "DOUB": 2, "TRIP": 3, "QUAD": 4}[self_linking_bond.order],
-            is_aromatic=self_linking_bond.aromatic,
-            stereochemistry=self_linking_bond.stereo,
-        ))
+        self.add_bond(
+            PDBBond(
+                atom1=self_to_combined[this_partner],
+                atom2=other_to_combined[other_partner],
+                bond_order={"SING": 1, "DOUB": 2, "TRIP": 3, "QUAD": 4}[
+                    self_linking_bond.order
+                ],
+                is_aromatic=self_linking_bond.aromatic,
+                stereochemistry=self_linking_bond.stereo,
+            )
+        )
 
         for bond in other.bonds:
             if bond.atom1 in other_leavers or bond.atom2 in other_leavers:
                 continue
 
-            self.add_bond(PDBBond(
-                atom1=other_to_combined[bond.atom1],
-                atom2=other_to_combined[bond.atom2],
-                bond_order=bond.bond_order,
-                is_aromatic=bond.is_aromatic,
-                stereochemistry=bond.stereochemistry,
-            ))
+            self.add_bond(
+                PDBBond(
+                    atom1=other_to_combined[bond.atom1],
+                    atom2=other_to_combined[bond.atom2],
+                    bond_order=bond.bond_order,
+                    is_aromatic=bond.is_aromatic,
+                    stereochemistry=bond.stereochemistry,
+                )
+            )
 
 
 T = TypeVar("T")
@@ -477,6 +491,43 @@ class CcdResidueDefinition:
         return molecule
 
 
+def dec_hex(s: str) -> int:
+    """
+    Interpret a string as a decimal or hexadecimal integer.
+
+    For a string of length n, the string is interpreted as decimal if the value
+    is < 10^n. This makes the dec_hex representation identical to a decimal
+    integer, except for strings that cannot be parsed as a decimal. For these
+    strings, the first hexadecimal number is interpreted as 10^n, and subsequent
+    numbers continue from there. For example, in PDB files, a fixed width column
+    format, residue numbers for large systems follow this representation:
+
+        "   1" -> 1
+        "   2" -> 2
+        ...
+        "9999" -> 9999
+        "A000" -> 10000
+        "A001" -> 10001
+        ...
+        "A009" -> 10009
+        "A00A" -> 10010
+        "A00B" -> 10011
+        ...
+        "A00F" -> 10015
+        "A010" -> 10016
+        ...
+    """
+
+    try:
+        return int(s, 10)
+    except ValueError:
+        n = len(s)
+        parsed_as_hex = int(s, 16)
+        smallest_hex = 0xA * 16 ** (n - 1)
+        largest_dec = 10**n - 1
+        return parsed_as_hex - smallest_hex + largest_dec + 1
+
+
 @dataclass
 class PdbData:
     model: list[int | None] = field(default_factory=list)
@@ -508,7 +559,7 @@ class PdbData:
         self.alt_loc[-1] = line[16].strip() or ""
         self.res_name[-1] = line[17:20].strip()
         self.chain_id[-1] = line[21].strip()
-        self.res_seq[-1] = int(line[22:26])
+        self.res_seq[-1] = dec_hex(line[22:26])
         self.i_code[-1] = line[26].strip() or ""
         self.x[-1] = float(line[30:38])
         self.y[-1] = float(line[38:46])
@@ -555,7 +606,7 @@ class PdbData:
             if line.startswith("TER   "):
                 terminated_resname = line[17:20].strip() or data.res_name[-1]
                 terminated_chainid = line[21].strip() or data.chain_id[-1]
-                terminated_resseq = int(line[22:26]) or data.res_seq[-1]
+                terminated_resseq = dec_hex(line[22:26]) or data.res_seq[-1]
                 for i in range(-1, -999, -1):
                     if (
                         data.res_name[i] == terminated_resname
@@ -574,7 +625,13 @@ class PdbData:
         indices = []
         prev = None
         for i, atom in enumerate(
-            zip(self.model, self.res_name, self.chain_id, self.res_seq, self.i_code)
+            zip(
+                self.model,
+                self.res_name,
+                self.chain_id,
+                self.res_seq,
+                self.i_code,
+            )
         ):
             if prev == atom or prev is None:
                 indices.append(i)
@@ -592,31 +649,32 @@ class PdbData:
         }
 
 
-class CcdCache(dict[str, CcdResidueDefinition]):
+class CcdCache(Mapping[str, CcdResidueDefinition]):
     def __init__(self, path: Path, preload: list[str] = []):
         self.path = path.resolve()
         self.path.mkdir(parents=True, exist_ok=True)
 
+        self.definitions = {}
+
         for file in path.glob("*.cif"):
             definition = CcdResidueDefinition.from_str(file.read_text())
-            self[definition.residueName.upper()] = definition
+            self.definitions[definition.residueName.upper()] = definition
 
-        for resname in set(preload) - set(self):
-            self.get_resname(resname)
+        for resname in set(preload) - set(self.definitions):
+            self.get(resname)
 
     def __repr__(self):
-        dictrepr = dict.__repr__(self)
-        return "%s(%s)" % (type(self).__name__, dictrepr)
+        return f"CcdCache(path={self.path}, preload={list(self.definitions)})"
 
-    def __getitem__(self, key):
-        return super().__getitem__(key.upper())
+    def __getitem__(self, key: str) -> CcdResidueDefinition:
+        resname = key.upper()
+        if resname in self.definitions:
+            return self.definitions[resname]
 
-    def __setitem__(self, key, val):
-        return super().__setitem__(key.upper(), val)
-
-    def update(self, *args, **kwargs):
-        for k, v in dict(*args, **kwargs).items():
-            self[k] = v
+        s = self._download_cif(resname)
+        definition = CcdResidueDefinition.from_str(s)
+        self.definitions[resname] = definition
+        return definition
 
     def _download_cif(self, resname: str) -> str:
         with urlopen(
@@ -627,17 +685,26 @@ class CcdCache(dict[str, CcdResidueDefinition]):
         path.write_text(s)
         return s
 
-    def get_resname(self, resname: str) -> CcdResidueDefinition:
-        """
-        Create a CCDResidueDefinition by parsing a CCD CIF file.
-        """
-        resname = resname.upper()
-        if resname in self:
-            return self[resname]
+    def __contains__(self, value) -> bool:
+        if value in ["UNK", "UNL"]:
+            # These residue names are reserved for unknown ligands/peptide residues
+            return False
 
-        s = self._download_cif(resname)
-        self[resname] = CcdResidueDefinition.from_str(s)
-        return self[resname]
+        if len(value) == 3:
+            # All residue names of three letters are assigned
+            return True
+
+        try:
+            self.get(value)
+            return True
+        except Exception:
+            return False
+
+    def __iter__(self) -> Iterator[str]:
+        return self.definitions.__iter__()
+
+    def __len__(self) -> int:
+        return self.definitions.__len__()
 
 
 CCD_RESIDUE_DEFINITION_CACHE = CcdCache(Path(__file__).parent / "../../.ccd_cache")
@@ -679,7 +746,206 @@ LINKING_TYPES: dict[str, CcdBondDefinition | None] = {
     # "saccharide".upper(): [],
 }
 
-def topology_from_pdb(path: PathLike) -> Topology:
+
+class SynonymDict:
+    def __init__(self, d: dict[str, dict[str, list[str]]]):
+        self.forward = d
+        self.to_canonical = {}
+        for resname, synonyms in d.items():
+            reverse_resname_dict = {}
+            self.to_canonical[resname] = reverse_resname_dict
+            for ccdname, pdbnames in synonyms.items():
+                reverse_resname_dict[ccdname] = ccdname
+                for pdbname in pdbnames:
+                    reverse_resname_dict[pdbname] = ccdname
+
+    def get_canonical_name(self, res_name: str, atom_name: str) -> str:
+        return self.to_canonical.get(res_name, {}).get(atom_name, atom_name)
+
+    def find_synonym(
+        self, res_name: str, canonical_name: str, match_in: set[str]
+    ) -> str | None:
+        if canonical_name in match_in:
+            return canonical_name
+
+        for synonym in self.forward.get(res_name, {}).get(canonical_name, []):
+            if synonym in match_in:
+                return synonym
+
+        return None
+
+    def format_with_synonyms(self, res_name: str, atom_names: set[str]) -> str:
+        atoms = []
+        residue_synonyms = self.forward.get(res_name, {})
+        for atom_name in atom_names:
+            atom_synonyms = residue_synonyms.get(atom_name, [])
+            if len(atom_synonyms) > 1:
+                atoms.append(
+                    f"{atom_name} (or one of its synonyms {','.join(atom_synonyms)})"
+                )
+            if len(atom_synonyms) == 1:
+                atoms.append(f"{atom_name} (or its synonym {atom_synonyms[0]})")
+            else:
+                atoms.append(atom_name)
+        return ", ".join(atoms)
+
+
+def load_unknown_residue(
+    data: PdbData, indices: list[int], unknown_molecules: list[Molecule]
+) -> PDBMolecule:
+    atoms = []
+    conects = set()
+    serial_to_index = {}
+    for i, pdb_index in enumerate(indices):
+        new_atom = PDBAtom(
+            atomic_number=elements.NUMBERS[data.element[pdb_index]],
+            formal_charge=data.charge[pdb_index],
+            is_aromatic=None,
+            stereochemistry=None,
+            name=data.name[pdb_index],
+            x=data.x[pdb_index],
+            y=data.y[pdb_index],
+            z=data.z[pdb_index],
+            metadata={
+                "residue_name": data.res_name[pdb_index],
+                "leaving": False,
+                "pdb_index": pdb_index,
+                "residue_number": data.res_seq[pdb_index],
+                "insertion_code": data.i_code[pdb_index],
+                "chain_id": data.chain_id[pdb_index],
+            },
+        )
+        atoms.append(new_atom)
+        serial_to_index[data.serial[pdb_index]] = i
+        for conect_serial in data.conects[pdb_index]:
+            conects.add(tuple(sorted([data.serial[pdb_index], conect_serial])))
+
+    bonds = []
+    for serial1, serial2 in conects:
+        bonds.append(
+            PDBBond(
+                atom1=serial_to_index[serial1],
+                atom2=serial_to_index[serial2],
+            )
+        )
+
+    pdbmol = PDBMolecule(
+        atoms=atoms,
+        bonds=bonds,
+        properties={"linking_type": "NON-POLYMER"},
+    )
+
+    for molecule in unknown_molecules:
+        (match_found, mapping) = Molecule.are_isomorphic(
+            pdbmol.to_networkx(),
+            molecule.to_networkx(),
+            return_atom_map=True,
+            aromatic_matching=False,
+            formal_charge_matching=False,
+            bond_order_matching=False,
+            atom_stereochemistry_matching=False,
+            bond_stereochemistry_matching=False,
+            strip_pyrimidal_n_atom_stereo=True,
+        )
+        if match_found:
+            reverse_map = {}
+            for i, atom in enumerate(pdbmol.atoms):
+                reverse_map[mapping[i]] = i
+                reference_atom = molecule.atom(mapping[i])
+                atom.formal_charge = reference_atom.formal_charge
+                atom.is_aromatic = reference_atom.is_aromatic
+                atom.stereochemistry = reference_atom.stereochemistry
+            pdbmol.bonds.clear()
+            for bond in molecule.bonds:
+                pdbmol.add_bond(
+                    PDBBond(
+                        atom1=reverse_map[bond.atom1_index],
+                        atom2=reverse_map[bond.atom2_index],
+                        bond_order=bond.bond_order,
+                        is_aromatic=bond.is_aromatic,
+                        stereochemistry=bond.stereochemistry,
+                    )
+                )
+            break
+    else:
+        res_name = pdbmol.atoms[0].metadata["residue_name"]
+        res_seq = pdbmol.atoms[0].metadata["residue_number"]
+        chain_id = pdbmol.atoms[0].metadata["chain_id"]
+        raise ValueError(
+            f"Unknown residue {chain_id}:{res_name}#{res_seq} could not be assigned chemistry from unknown_molecules"
+        )
+
+    return pdbmol
+
+
+def load_residue_from_database(
+    data: PdbData,
+    res_atom_idcs: list[int],
+    residue_database: Mapping[str, CcdResidueDefinition],
+    synonyms,
+) -> PDBMolecule:
+    prototype_index = res_atom_idcs[0]
+
+    res_name = data.res_name[prototype_index]
+    residue = residue_database[res_name].to_pdb_molecule()
+
+    atom_names_to_indices = {data.name[i]: i for i in res_atom_idcs}
+    ccd_residue_atom_names = {atom.name for atom in residue.atoms}
+
+    residue_wide_metadata = {
+        "residue_number": data.res_seq[prototype_index],
+        "insertion_code": data.i_code[prototype_index],
+        "chain_id": data.chain_id[prototype_index],
+    }
+
+    for name, index in list(atom_names_to_indices.items()):
+        if synonyms.get_canonical_name(res_name, name) in ccd_residue_atom_names:
+            continue
+        else:
+            raise ValueError(
+                f"Atom {name}#{index} in PDB file not present in CCD entry {res_name}.",
+                f"Expected atom names {synonyms.format_with_synonyms(res_name, ccd_residue_atom_names)}",
+            )
+
+    for atom in residue.atoms:
+        used_synonym = synonyms.find_synonym(
+            res_name, atom.name, set(atom_names_to_indices)
+        )
+
+        if used_synonym is not None:
+            pdb_index = atom_names_to_indices[used_synonym]
+            atom.x = data.x[pdb_index]
+            atom.y = data.y[pdb_index]
+            atom.z = data.z[pdb_index]
+            atom_specific_metadata = {
+                "pdb_index": pdb_index,
+                "used_synonym": used_synonym,
+            }
+        else:
+            atom_specific_metadata = {}
+
+        atom.metadata.update(residue_wide_metadata | atom_specific_metadata)
+
+    return residue
+
+
+SYNONYMS = SynonymDict(
+    {
+        "NME": {"HN2": ["H"]},
+        "NA": {"NA": ["Na"]},
+        "CL": {"CL": ["Cl"]},
+    }
+)
+
+
+def topology_from_pdb(
+    path: PathLike,
+    replace_missing_atoms=False,
+    use_canonical_names=True,
+    unknown_molecules: list[Molecule] = [],
+    residue_database: Mapping[str, CcdResidueDefinition] = CCD_RESIDUE_DEFINITION_CACHE,
+    synonyms=SYNONYMS,
+) -> Topology:
     path = Path(path)
     data = PdbData.parse_pdb(path.read_text().splitlines())
 
@@ -689,41 +955,29 @@ def topology_from_pdb(path: PathLike) -> Topology:
     prev_model = __UNSET__
     for res_atom_idcs in data.residues():
         prototype_index = res_atom_idcs[0]
+        res_name = data.res_name[prototype_index]
 
         if prev_chain_id is __UNSET__:
             prev_chain_id = data.chain_id[prototype_index]
         if prev_model is __UNSET__:
             prev_model = data.model[prototype_index]
 
-        res_name = data.res_name[prototype_index]
-        residue = CCD_RESIDUE_DEFINITION_CACHE.get_resname(res_name).to_pdb_molecule()
+        # TODO: UNK is for unknown peptide residues, but we just treat it as a ligand
+        # Note that for the CCD_RESIDUE_DEFINITION_CACHE, "not in" includes a check
+        # for the residue names "UNL" and "UNK"
+        if res_name not in residue_database:
+            residue = load_unknown_residue(data, res_atom_idcs, unknown_molecules)
+        else:
+            residue = load_residue_from_database(
+                data, res_atom_idcs, residue_database, synonyms
+            )
 
-        atom_names_to_indices = {data.name[i]: i for i in res_atom_idcs}
-        ccd_residue_atom_names = {atom.name for atom in residue.atoms}
-
-        residue_wide_metadata = {
-            "residue_number": data.res_seq[prototype_index],
-            "insertion_code": data.i_code[prototype_index],
-            "chain_id": data.chain_id[prototype_index],
-        }
-        for atom in residue.atoms:
-            if atom.name not in ccd_residue_atom_names:
-                raise ValueError(
-                    "Atom {atom.name} in PDB file not present in residue {res_name}"
-                )
-
-            if atom.name in atom_names_to_indices:
-                pdb_index = atom_names_to_indices[atom.name]
-                atom.x = data.x[pdb_index]
-                atom.y = data.y[pdb_index]
-                atom.z = data.z[pdb_index]
-                atom_specific_metadata = {
-                    "pdb_index": pdb_index,
-                }
-            else:
-                atom_specific_metadata = {}
-
-            atom.metadata.update(residue_wide_metadata | atom_specific_metadata)
+        if (
+            residue.properties["linking_type"] == "NON-POLYMER"
+            and not current_molecule.is_empty()
+        ):
+            molecules.append(current_molecule)
+            current_molecule = PDBMolecule()
 
         current_molecule.combine_with(residue)
 
@@ -743,6 +997,41 @@ def topology_from_pdb(path: PathLike) -> Topology:
         prev_chain_id = data.chain_id[prototype_index]
         prev_model = data.model[prototype_index]
 
-    topology = Topology.from_molecules([pdbmol.to_openff_molecule() for pdbmol in molecules])
+    if not replace_missing_atoms:
+        missing_atoms = []
+        for molecule in molecules:
+            for atom in molecule.atoms:
+                if "pdb_index" not in atom.metadata:
+                    missing_atoms.append(atom)
+        if missing_atoms:
+            raise MissingAtomsFromPDBError(missing_atoms)
+
+    if not use_canonical_names:
+        for molecule in molecules:
+            for atom in molecule.atoms:
+                atom.metadata["canonical_name"] = atom.name
+                atom.name = atom.metadata.pop("used_synonym", atom.name)
+
+    topology = Topology.from_molecules(
+        [pdbmol.to_openff_molecule() for pdbmol in molecules]
+    )
 
     return topology
+
+
+class MissingAtomsFromPDBError(ValueError):
+    def __init__(self, missing_atoms: list[PDBAtom]) -> None:
+        message = ["The following atoms from the CCD were missing from the PDB file:"]
+        for atom in missing_atoms:
+            chain = atom.metadata["chain_id"]
+            res_name = atom.metadata["residue_name"]
+            icode = atom.metadata["insertion_code"]
+            res_seq = atom.metadata["residue_number"]
+
+            residue = f"{res_name}#{res_seq:0>4}{icode}"
+            if chain:
+                residue = f"{chain}:" + residue
+            message.append(f"    Atom {atom.name} in residue {residue}")
+
+        self.missing_atoms = missing_atoms
+        super().__init__("\n".join(message))
