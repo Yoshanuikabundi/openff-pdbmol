@@ -1,9 +1,10 @@
 from collections.abc import Mapping
+from copy import deepcopy
 from io import StringIO
 from itertools import chain
 from os import PathLike
 from time import sleep
-from typing import Any, Iterable, Self, Literal, Iterator, TypeVar
+from typing import Any, Generator, Iterable, Self, Literal, Iterator, TypeVar
 from pathlib import Path
 from dataclasses import dataclass, field
 import dataclasses
@@ -13,10 +14,118 @@ from openff.toolkit import Molecule, Topology
 from openff.toolkit.topology import Atom, Bond
 from openff.units import elements, unit
 from openmm.app.internal.pdbx.reader.PdbxReader import PdbxReader
+import numpy as np
 
 
 class __UNSET__:
     pass
+
+
+@dataclass
+class PDBAtom:
+    atomic_number: int
+    formal_charge: int
+    is_aromatic: bool
+    stereochemistry: Literal["S", "R", None]
+    name: str
+    x: float | None = None
+    y: float | None = None
+    z: float | None = None
+    metadata: dict = field(default_factory=dict)
+
+    @property
+    def coords(self) -> tuple[float, float, float] | None:
+        if self.x is None or self.y is None or self.z is None:
+            return None
+        else:
+            return (self.x, self.y, self.z)
+
+@dataclass
+class PDBBond:
+    atom1: int
+    atom2: int
+    bond_order: int | None = None
+    is_aromatic: bool | None = None
+    stereochemistry: Literal["E", "Z", None] = None
+
+
+@dataclass
+class PDBMolecule:
+    atoms: list[PDBAtom] = field(default_factory=list)
+    bonds: list[PDBBond] = field(default_factory=list)
+    properties: dict[str, Any] = field(default_factory=dict)
+
+    def add_atom(self, atom: PDBAtom):
+        self.atoms.append(atom)
+
+    def add_bond(self, bond: PDBBond):
+        self.bonds.append(bond)
+
+    def atoms_bonded_to(self, index: int) -> Generator[int, None, None]:
+        for bond in self.bonds:
+            if bond.atom1 == index:
+                yield bond.atom2
+            if bond.atom2 == index:
+                yield bond.atom1
+
+
+    def identify_linkers(
+        self, linked_atomname: str
+    ) -> tuple[int, PDBAtom, set[int]]:
+        possible_partners = [
+            (i, atom)
+            for i, atom in enumerate(self.atoms)
+            if atom.name == linked_atomname
+        ]
+        for partner, partner_atom in possible_partners:
+            leavers = set()
+            candidates = set(self.atoms_bonded_to(partner))
+            while candidates:
+                candidate = candidates.pop()
+                candidate_atom = self.atoms[candidate]
+                if candidate_atom.metadata.get("leaving", False):
+                    leavers.add(candidate)
+                    candidates.update(set(self.atoms_bonded_to(candidate)) - leavers)
+            if leavers:
+                return (partner, partner_atom, leavers)
+        raise ValueError("No partners found")
+
+    def to_openff_molecule(self) -> Molecule:
+        molecule = Molecule()
+        molecule.properties.update(self.properties)
+        conformer = []
+
+        for atom in self.atoms:
+            molecule._add_atom(
+                atomic_number = atom.atomic_number,
+                formal_charge= atom.formal_charge,
+                is_aromatic= atom.is_aromatic,
+                stereochemistry=atom.stereochemistry,
+                name = atom.name,
+                metadata = atom.metadata,
+                invalidate_cache=False
+            )
+
+            if atom.coords is None:
+                # TODO: Come up with something clever here
+                conformer.append((0., 0., 0.))
+            else:
+                conformer.append(atom.coords)
+
+        for bond in self.bonds:
+            molecule._add_bond(
+                atom1=bond.atom1,
+                atom2=bond.atom2,
+                bond_order = bond.bond_order,
+                is_aromatic=bond.is_aromatic,
+                stereochemistry=bond.stereochemistry,
+                invalidate_cache=False
+            )
+
+        molecule._invalidate_cached_properties()
+
+        molecule.add_conformer(np.asarray(conformer) * unit.angstrom)
+        return molecule
 
 
 T = TypeVar("T")
@@ -201,6 +310,42 @@ class CcdResidueDefinition:
         #             + f" SMILES {smiles} from the CCD entry, parsed as"
         #             + f" {from_smiles}"
         #         )
+
+        molecule.properties.update(
+            {
+                "linking_type": self.linking_type,
+            }
+        )
+
+        return molecule
+
+    def to_pdb_molecule(self) -> PDBMolecule:
+        molecule = PDBMolecule()
+        atoms: dict[str, int] = {}
+        for atom in self.atoms:
+            new_atom = PDBAtom(
+                atomic_number=elements.NUMBERS[atom.symbol],
+                formal_charge=atom.charge,
+                is_aromatic=atom.aromatic,
+                stereochemistry=atom.stereo,
+                name=atom.name,
+                metadata={
+                    "residue_name": self.residueName,
+                    "leaving": atom.leaving,
+                },
+            )
+            atoms[atom.name] = len(molecule.atoms)
+            molecule.add_atom(new_atom)
+
+        for bond in self.bonds:
+            new_bond = PDBBond(
+                atom1=atoms[bond.atom1],
+                atom2=atoms[bond.atom2],
+                bond_order={"SING": 1, "DOUB": 2, "TRIP": 3, "QUAD": 4}[bond.order],
+                is_aromatic=bond.aromatic,
+                stereochemistry=bond.stereo,
+            )
+            molecule.add_bond(new_bond)
 
         molecule.properties.update(
             {
@@ -434,16 +579,15 @@ def identify_linkers(
             return (partner, partner_atom, leavers)
     raise ValueError("No partners found")
 
-
-def combine_molecules(this: Molecule, other: Molecule):
+def combine_pdb_molecules(this: PDBMolecule, other: PDBMolecule) -> PDBMolecule:
     """
     Combine molecules by unifying leaving atoms with the opposite molecule
 
     Preserves leaving annotations in ``other`` but not in ``this``.
     """
     # If this is empty, short circuit
-    if this.n_atoms == 0:
-        return Molecule(other)
+    if len(this.atoms) == 0:
+        return deepcopy(other)
 
     # Identify the bond linking the two molecules
     this_linking_type = this.properties["linking_type"]
@@ -466,81 +610,66 @@ def combine_molecules(this: Molecule, other: Molecule):
         raise ValueError(f"Linking type {other_linking_type} does not form linkages")
 
     # Identify the atoms participating in the bond and those leaving
-    this_partner, this_partner_atom, this_leavers = identify_linkers(
-        this, linking_bond.atom1
+    this_partner, this_partner_atom, this_leavers = this.identify_linkers(
+        linking_bond.atom1
     )
-    other_partner, other_partner_atom, other_leavers = identify_linkers(
-        other, linking_bond.atom2
+    other_partner, other_partner_atom, other_leavers = other.identify_linkers(
+        linking_bond.atom2
     )
 
     # Add atoms
-    combined = Molecule()
+    combined = PDBMolecule()
     combined.properties.update(this.properties | other.properties)
-    # TODO: Preserve conformers and other data
-    this_to_combined = {}
+    this_to_combined: dict[int, int] = {}
     for i, atom in enumerate(this.atoms):
-        if atom in this_leavers:
+        if i in this_leavers:
             continue
 
-        this_to_combined[i] = combined._add_atom(
-            atomic_number=atom.atomic_number,
-            formal_charge=atom.formal_charge,
-            is_aromatic=atom.is_aromatic,
-            stereochemistry=atom.stereochemistry,
-            name=atom.name,
-            metadata=atom.metadata | {"leaving": False},
-            invalidate_cache=False,
-        )
+        new_atom = deepcopy(atom)
+        new_atom.metadata.update({"leaving": False})
+        this_to_combined[i] = len(combined.atoms)
+        combined.add_atom(new_atom)
 
-    other_to_combined = {}
+    other_to_combined: dict[int, int] = {}
     for i, atom in enumerate(other.atoms):
-        if atom in other_leavers:
+        if i in other_leavers:
             continue
 
-        other_to_combined[i] = combined._add_atom(
-            atomic_number=atom.atomic_number,
-            formal_charge=atom.formal_charge,
-            is_aromatic=atom.is_aromatic,
-            stereochemistry=atom.stereochemistry,
-            name=atom.name,
-            metadata=atom.metadata,
-            invalidate_cache=False,
-        )
+        other_to_combined[i] = len(combined.atoms)
+        combined.add_atom(deepcopy(atom))
 
     # Add bonds
     for bond in this.bonds:
         if bond.atom1 in this_leavers or bond.atom2 in this_leavers:
             continue
 
-        combined._add_bond(
-            atom1=this_to_combined[bond.atom1_index],
-            atom2=this_to_combined[bond.atom2_index],
+        combined.add_bond(PDBBond(
+            atom1=this_to_combined[bond.atom1],
+            atom2=this_to_combined[bond.atom2],
             bond_order=bond.bond_order,
             is_aromatic=bond.is_aromatic,
             stereochemistry=bond.stereochemistry,
-            invalidate_cache=False,
-        )
+        ))
 
     for bond in other.bonds:
         if bond.atom1 in other_leavers or bond.atom2 in other_leavers:
             continue
 
-        combined._add_bond(
-            atom1=other_to_combined[bond.atom1_index],
-            atom2=other_to_combined[bond.atom2_index],
+        combined.add_bond(PDBBond(
+            atom1=other_to_combined[bond.atom1],
+            atom2=other_to_combined[bond.atom2],
             bond_order=bond.bond_order,
             is_aromatic=bond.is_aromatic,
             stereochemistry=bond.stereochemistry,
-            invalidate_cache=False,
-        )
+        ))
 
-    combined.add_bond(
+    combined.add_bond(PDBBond(
         atom1=this_to_combined[this_partner],
         atom2=other_to_combined[other_partner],
         bond_order={"SING": 1, "DOUB": 2, "TRIP": 3, "QUAD": 4}[linking_bond.order],
         is_aromatic=linking_bond.aromatic,
         stereochemistry=linking_bond.stereo,
-    )
+    ))
 
     return combined
 
@@ -549,8 +678,8 @@ def topology_from_pdb(path: PathLike) -> Topology:
     path = Path(path)
     data = PdbData.parse_pdb(path.read_text().splitlines())
 
-    molecules = []
-    current_molecule = Molecule()
+    molecules: list[PDBMolecule] = []
+    current_molecule = PDBMolecule()
     prev_chain_id = __UNSET__
     prev_model = __UNSET__
     for res_atom_idcs in data.residues():
@@ -562,7 +691,7 @@ def topology_from_pdb(path: PathLike) -> Topology:
             prev_model = data.model[prototype_index]
 
         res_name = data.res_name[prototype_index]
-        residue = CCD_RESIDUE_DEFINITION_CACHE.get_resname(res_name).to_molecule()
+        residue = CCD_RESIDUE_DEFINITION_CACHE.get_resname(res_name).to_pdb_molecule()
 
         atom_names_to_indices = {data.name[i]: i for i in res_atom_idcs}
         ccd_residue_atom_names = {atom.name for atom in residue.atoms}
@@ -580,19 +709,18 @@ def topology_from_pdb(path: PathLike) -> Topology:
 
             if atom.name in atom_names_to_indices:
                 pdb_index = atom_names_to_indices[atom.name]
-                x = data.x[pdb_index]
-                y = data.y[pdb_index]
-                z = data.z[pdb_index]
+                atom.x = data.x[pdb_index]
+                atom.y = data.y[pdb_index]
+                atom.z = data.z[pdb_index]
                 atom_specific_metadata = {
                     "pdb_index": pdb_index,
-                    "pdb_coords": f"{x} {y} {z}",
                 }
             else:
                 atom_specific_metadata = {}
 
             atom.metadata.update(residue_wide_metadata | atom_specific_metadata)
 
-        current_molecule = combine_molecules(current_molecule, residue)
+        current_molecule = combine_pdb_molecules(current_molecule, residue)
 
         if (
             data.terminated[prototype_index]
@@ -601,7 +729,7 @@ def topology_from_pdb(path: PathLike) -> Topology:
             or current_molecule.properties["linking_type"] == "NON-POLYMER"
         ):
             molecules.append(current_molecule)
-            current_molecule = Molecule()
+            current_molecule = PDBMolecule()
 
         # TODO: Load other data from PDB file
         # TODO: Incorporate CONECT records
@@ -610,23 +738,6 @@ def topology_from_pdb(path: PathLike) -> Topology:
         prev_chain_id = data.chain_id[prototype_index]
         prev_model = data.model[prototype_index]
 
-    topology = Topology.from_molecules(molecules)
-
-    positions = []
-    for atom in topology.atoms:
-        if "pdb_coords" in atom.metadata:
-            coords = atom.metadata["pdb_coords"]
-        else:
-            # TODO: Generate coordinates for atoms missing from PDB file
-            coords = next(
-                (
-                    atom.metadata["pdb_coords"]
-                    for atom in atom.bonded_atoms
-                    if "pdb_coords" in atom.metadata
-                ),
-                "0 0 0",
-            )
-        positions.append([float(s) for s in coords.split()])
-    topology.set_positions(positions * unit.angstrom)
+    topology = Topology.from_molecules([pdbmol.to_openff_molecule() for pdbmol in molecules])
 
     return topology
