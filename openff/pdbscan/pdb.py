@@ -68,6 +68,16 @@ class PDBMolecule:
             if bond.atom2 == index:
                 yield bond.atom1
 
+    def is_empty(self) -> bool:
+        return len(self.atoms) == 0 and len(self.bonds) == 0 and len(self.properties) == 0
+
+    @property
+    def n_atoms(self) -> int:
+        return len(self.atoms)
+
+    @property
+    def n_bonds(self) -> int:
+        return len(self.bonds)
 
     def identify_linkers(
         self, linked_atomname: str
@@ -126,6 +136,100 @@ class PDBMolecule:
 
         molecule.add_conformer(np.asarray(conformer) * unit.angstrom)
         return molecule
+
+    def combine_with(self, other: "PDBMolecule"):
+        """
+        Combine molecules by unifying leaving atoms with the opposite molecule
+
+        Preserves leaving annotations in ``other`` but not in ``self``.
+        """
+        # If this is empty, short circuit
+        if self.is_empty():
+            self.atoms = deepcopy(other.atoms)
+            self.bonds = deepcopy(other.bonds)
+            self.properties = deepcopy(other.properties)
+            return
+
+        # Identify the bond linking the two molecules
+        self_linking_type = self.properties["linking_type"]
+        other_linking_type = other.properties["linking_type"]
+
+        if self_linking_type not in LINKING_TYPES:
+            raise ValueError(f"Unknown linking type {self_linking_type}")
+        if other_linking_type not in LINKING_TYPES:
+            raise ValueError(f"Unknown linking type {other_linking_type}")
+
+
+        self_linking_bond = LINKING_TYPES[self_linking_type]
+        other_linking_bond = LINKING_TYPES[other_linking_type]
+        if self_linking_bond is None:
+            raise ValueError(f"Linking type {self_linking_type} does not form linkages")
+        if other_linking_bond is None:
+            raise ValueError(f"Linking type {self_linking_type} does not form linkages")
+        if self_linking_bond != other_linking_bond:
+            raise ValueError(
+                f"Molecule of linking type {self_linking_type} cannot be linked to"
+                + f" molecule of linking type {other_linking_type}"
+            )
+
+        # Identify the atoms participating in the bond and those leaving
+        this_partner, this_partner_atom, this_leavers = self.identify_linkers(
+            self_linking_bond.atom1
+        )
+        other_partner, other_partner_atom, other_leavers = other.identify_linkers(
+            self_linking_bond.atom2
+        )
+
+        # Add atoms
+        self.properties.update(other.properties)
+        self_to_combined: dict[int, int] = {}
+        n_atoms_removed = 0
+        for i, atom in list(enumerate(self.atoms)):
+            if i in this_leavers:
+                del self.atoms[i - n_atoms_removed]
+                n_atoms_removed += 1
+            else:
+                atom.metadata.update({"leaving": False})
+                self_to_combined[i] = i - n_atoms_removed
+
+        other_to_combined: dict[int, int] = {}
+        for i, atom in enumerate(other.atoms):
+            if i in other_leavers:
+                continue
+
+            other_to_combined[i] = len(self.atoms)
+            self.add_atom(deepcopy(atom))
+
+        # Add bonds
+        n_bonds_removed = 0
+        for i, bond in list(enumerate(self.bonds)):
+            if bond.atom1 in this_leavers or bond.atom2 in this_leavers:
+                del self.bonds[i - n_bonds_removed]
+                n_bonds_removed += 1
+            else:
+                bond.atom1 = self_to_combined[bond.atom1]
+                bond.atom2 = self_to_combined[bond.atom2]
+
+
+        self.add_bond(PDBBond(
+            atom1=self_to_combined[this_partner],
+            atom2=other_to_combined[other_partner],
+            bond_order={"SING": 1, "DOUB": 2, "TRIP": 3, "QUAD": 4}[self_linking_bond.order],
+            is_aromatic=self_linking_bond.aromatic,
+            stereochemistry=self_linking_bond.stereo,
+        ))
+
+        for bond in other.bonds:
+            if bond.atom1 in other_leavers or bond.atom2 in other_leavers:
+                continue
+
+            self.add_bond(PDBBond(
+                atom1=other_to_combined[bond.atom1],
+                atom2=other_to_combined[bond.atom2],
+                bond_order=bond.bond_order,
+                is_aromatic=bond.is_aromatic,
+                stereochemistry=bond.stereochemistry,
+            ))
 
 
 T = TypeVar("T")
@@ -558,122 +662,6 @@ LINKING_TYPES: dict[str, CcdBondDefinition | None] = {
     # "saccharide".upper(): [],
 }
 
-
-def identify_linkers(
-    molecule: Molecule, linked_atomname: str
-) -> tuple[int, Atom, set[Atom]]:
-    possible_partners = [
-        (i, atom)
-        for i, atom in enumerate(molecule.atoms)
-        if atom.name == linked_atomname
-    ]
-    for partner, partner_atom in possible_partners:
-        leavers = set()
-        candidates = set(partner_atom.bonded_atoms)
-        while candidates:
-            candidate = candidates.pop()
-            if candidate.metadata.get("leaving", False):
-                leavers.add(candidate)
-                candidates.update(set(candidate.bonded_atoms) - leavers)
-        if leavers:
-            return (partner, partner_atom, leavers)
-    raise ValueError("No partners found")
-
-def combine_pdb_molecules(this: PDBMolecule, other: PDBMolecule) -> PDBMolecule:
-    """
-    Combine molecules by unifying leaving atoms with the opposite molecule
-
-    Preserves leaving annotations in ``other`` but not in ``this``.
-    """
-    # If this is empty, short circuit
-    if len(this.atoms) == 0:
-        return deepcopy(other)
-
-    # Identify the bond linking the two molecules
-    this_linking_type = this.properties["linking_type"]
-    other_linking_type = this.properties["linking_type"]
-
-    if this_linking_type != other_linking_type:
-        raise ValueError(
-            f"Molecule of linking type {this_linking_type} cannot be linked to"
-            + f" molecule of linking type {other_linking_type}"
-        )
-    if this_linking_type not in LINKING_TYPES:
-        raise ValueError(f"Unknown linking type {this_linking_type}")
-    if other_linking_type not in LINKING_TYPES:
-        raise ValueError(f"Unknown linking type {other_linking_type}")
-    if LINKING_TYPES[this_linking_type] is None:
-        raise ValueError(f"Linking type {this_linking_type} does not form linkages")
-
-    linking_bond = LINKING_TYPES[other_linking_type]
-    if linking_bond is None:
-        raise ValueError(f"Linking type {other_linking_type} does not form linkages")
-
-    # Identify the atoms participating in the bond and those leaving
-    this_partner, this_partner_atom, this_leavers = this.identify_linkers(
-        linking_bond.atom1
-    )
-    other_partner, other_partner_atom, other_leavers = other.identify_linkers(
-        linking_bond.atom2
-    )
-
-    # Add atoms
-    combined = PDBMolecule()
-    combined.properties.update(this.properties | other.properties)
-    this_to_combined: dict[int, int] = {}
-    for i, atom in enumerate(this.atoms):
-        if i in this_leavers:
-            continue
-
-        new_atom = deepcopy(atom)
-        new_atom.metadata.update({"leaving": False})
-        this_to_combined[i] = len(combined.atoms)
-        combined.add_atom(new_atom)
-
-    other_to_combined: dict[int, int] = {}
-    for i, atom in enumerate(other.atoms):
-        if i in other_leavers:
-            continue
-
-        other_to_combined[i] = len(combined.atoms)
-        combined.add_atom(deepcopy(atom))
-
-    # Add bonds
-    for bond in this.bonds:
-        if bond.atom1 in this_leavers or bond.atom2 in this_leavers:
-            continue
-
-        combined.add_bond(PDBBond(
-            atom1=this_to_combined[bond.atom1],
-            atom2=this_to_combined[bond.atom2],
-            bond_order=bond.bond_order,
-            is_aromatic=bond.is_aromatic,
-            stereochemistry=bond.stereochemistry,
-        ))
-
-    for bond in other.bonds:
-        if bond.atom1 in other_leavers or bond.atom2 in other_leavers:
-            continue
-
-        combined.add_bond(PDBBond(
-            atom1=other_to_combined[bond.atom1],
-            atom2=other_to_combined[bond.atom2],
-            bond_order=bond.bond_order,
-            is_aromatic=bond.is_aromatic,
-            stereochemistry=bond.stereochemistry,
-        ))
-
-    combined.add_bond(PDBBond(
-        atom1=this_to_combined[this_partner],
-        atom2=other_to_combined[other_partner],
-        bond_order={"SING": 1, "DOUB": 2, "TRIP": 3, "QUAD": 4}[linking_bond.order],
-        is_aromatic=linking_bond.aromatic,
-        stereochemistry=linking_bond.stereo,
-    ))
-
-    return combined
-
-
 def topology_from_pdb(path: PathLike) -> Topology:
     path = Path(path)
     data = PdbData.parse_pdb(path.read_text().splitlines())
@@ -720,7 +708,7 @@ def topology_from_pdb(path: PathLike) -> Topology:
 
             atom.metadata.update(residue_wide_metadata | atom_specific_metadata)
 
-        current_molecule = combine_pdb_molecules(current_molecule, residue)
+        current_molecule.combine_with(residue)
 
         if (
             data.terminated[prototype_index]
