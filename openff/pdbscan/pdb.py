@@ -7,6 +7,7 @@ from os import PathLike
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Generator,
     Iterable,
     Iterator,
@@ -120,7 +121,40 @@ class PDBMolecule:
                     candidates.update(bond_network[candidate] - leavers)
             if leavers:
                 return (partner, partner_atom, leavers)
-        raise ValueError("No partners found")
+        raise ValueError(
+            f"No partners found: expected {
+                linked_atomname
+            }, found {[
+                (atom.name, atom.metadata.get("atom_serial", ""))
+                for (_, atom) in possible_partners
+            ]}, but none of them have leaving atoms"
+        )
+
+    def titrate_added_atoms(self, protonation_variants: Mapping[str, list[str]]):
+        atoms_to_remove = []
+        for i, atom in enumerate(self.atoms):
+            if (
+                "pdb_index" not in atom.metadata
+                and atom.atomic_number == 1
+                and atom.name
+                in protonation_variants.get(atom.metadata.get("residue_name", ""), [])
+            ):
+                candidates = [*self.atoms_bonded_to(i)]
+                if len(candidates) == 1:
+                    bonded_atom = self.atoms[candidates[0]]
+                    bonded_atom.formal_charge -= 1
+                    atoms_to_remove.append(i)
+
+        n_atoms_removed = 0
+        for i in atoms_to_remove:
+            i = i - n_atoms_removed
+            for bond_index, bond in list(enumerate(self.bonds)):
+                if bond.atom1 == i or bond.atom2 == i:
+                    del self.bonds[bond_index]
+                bond.atom1 = bond.atom1 if bond.atom1 < i else bond.atom1 - 1
+                bond.atom2 = bond.atom2 if bond.atom2 < i else bond.atom2 - 1
+            del self.atoms[i]
+            n_atoms_removed += 1
 
     def to_openff_molecule(self) -> Molecule:
         molecule = Molecule()
@@ -650,30 +684,58 @@ class PdbData:
 
 
 class CcdCache(Mapping[str, CcdResidueDefinition]):
-    def __init__(self, path: Path, preload: list[str] = []):
+    def __init__(
+        self,
+        path: Path,
+        preload: list[str] = [],
+        patches: dict[str, Callable[[CcdResidueDefinition], CcdResidueDefinition]] = {},
+    ):
         self.path = path.resolve()
         self.path.mkdir(parents=True, exist_ok=True)
 
         self.definitions = {}
+        self.patches = dict(patches)
 
         for file in path.glob("*.cif"):
-            definition = CcdResidueDefinition.from_str(file.read_text())
-            self.definitions[definition.residueName.upper()] = definition
+            self._add_definition_from_str(file.read_text())
 
         for resname in set(preload) - set(self.definitions):
             self.get(resname)
 
     def __repr__(self):
-        return f"CcdCache(path={self.path}, preload={list(self.definitions)})"
+        return f"CcdCache(path={
+            self.path
+        }, preload={
+            list(self.definitions)
+        }, patches={
+            self.patches!r
+        })"
 
     def __getitem__(self, key: str) -> CcdResidueDefinition:
-        resname = key.upper()
-        if resname in self.definitions:
-            return self.definitions[resname]
+        res_name = key.upper()
+        if res_name in self.definitions:
+            return self.definitions[res_name]
 
-        s = self._download_cif(resname)
+        try:
+            s = (self.path / f"{res_name.upper()}.cif").read_text()
+        except Exception:
+            s = self._download_cif(res_name)
+
+        return self._add_definition_from_str(s, res_name=res_name)
+
+    def _add_definition_from_str(
+        self, s: str, res_name: str | None = None
+    ) -> CcdResidueDefinition:
         definition = CcdResidueDefinition.from_str(s)
-        self.definitions[resname] = definition
+        if res_name is None:
+            res_name = definition.residueName.upper()
+
+        patch = self.patches.get(definition.residueName.upper(), lambda x: x)
+        definition = patch(definition)
+
+        assert res_name == definition.residueName.upper()
+
+        self.definitions[res_name] = definition
         return definition
 
     def _download_cif(self, resname: str) -> str:
@@ -707,7 +769,22 @@ class CcdCache(Mapping[str, CcdResidueDefinition]):
         return self.definitions.__len__()
 
 
-CCD_RESIDUE_DEFINITION_CACHE = CcdCache(Path(__file__).parent / "../../.ccd_cache")
+def set_peptide_linking_type(res: CcdResidueDefinition) -> CcdResidueDefinition:
+    res.linking_type = "PEPTIDE LINKING"
+
+    if res.residueName == "ACE":
+        for atom in res.atoms:
+            if atom.name == "H":
+                atom.leaving = True
+                break
+
+    return res
+
+
+CCD_RESIDUE_DEFINITION_CACHE = CcdCache(
+    Path(__file__).parent / "../../.ccd_cache",
+    patches={"ACE": set_peptide_linking_type, "NME": set_peptide_linking_type},
+)
 
 # TODO: Fill in this data
 LINKING_TYPES: dict[str, CcdBondDefinition | None] = {
@@ -747,8 +824,8 @@ LINKING_TYPES: dict[str, CcdBondDefinition | None] = {
 }
 
 
-class SynonymDict:
-    def __init__(self, d: dict[str, dict[str, list[str]]]):
+class SynonymDict(Mapping):
+    def __init__(self, d: Mapping[str, Mapping[str, list[str]]]):
         self.forward = d
         self.to_canonical = {}
         for resname, synonyms in d.items():
@@ -758,6 +835,15 @@ class SynonymDict:
                 reverse_resname_dict[ccdname] = ccdname
                 for pdbname in pdbnames:
                     reverse_resname_dict[pdbname] = ccdname
+
+    def __getitem__(self, key: str) -> Mapping[str, list[str]]:
+        return self.forward.__getitem__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return self.forward.__iter__()
+
+    def __len__(self) -> int:
+        return self.forward.__len__()
 
     def get_canonical_name(self, res_name: str, atom_name: str) -> str:
         return self.to_canonical.get(res_name, {}).get(atom_name, atom_name)
@@ -790,7 +876,7 @@ class SynonymDict:
         return ", ".join(atoms)
 
 
-def load_unknown_residue(
+def _load_unknown_residue(
     data: PdbData, indices: list[int], unknown_molecules: list[Molecule]
 ) -> PDBMolecule:
     atoms = []
@@ -813,6 +899,7 @@ def load_unknown_residue(
                 "residue_number": data.res_seq[pdb_index],
                 "insertion_code": data.i_code[pdb_index],
                 "chain_id": data.chain_id[pdb_index],
+                "atom_serial": data.serial[pdb_index],
             },
         )
         atoms.append(new_atom)
@@ -878,11 +965,11 @@ def load_unknown_residue(
     return pdbmol
 
 
-def load_residue_from_database(
+def _load_residue_from_database(
     data: PdbData,
     res_atom_idcs: list[int],
     residue_database: Mapping[str, CcdResidueDefinition],
-    synonyms,
+    synonyms: SynonymDict,
 ) -> PDBMolecule:
     prototype_index = res_atom_idcs[0]
 
@@ -920,6 +1007,8 @@ def load_residue_from_database(
             atom_specific_metadata = {
                 "pdb_index": pdb_index,
                 "used_synonym": used_synonym,
+                "canonical_name": atom.name,
+                "atom_serial": data.serial[pdb_index],
             }
         else:
             atom_specific_metadata = {}
@@ -929,25 +1018,31 @@ def load_residue_from_database(
     return residue
 
 
-SYNONYMS = SynonymDict(
-    {
-        "NME": {"HN2": ["H"]},
-        "NA": {"NA": ["Na"]},
-        "CL": {"CL": ["Cl"]},
-    }
-)
+SYNONYMS = {
+    "NME": {"HN2": ["H"]},
+    "NA": {"NA": ["Na"]},
+    "CL": {"CL": ["Cl"]},
+}
+
+PROTEIN_PROTONATION_VARIANTS = {
+    "GLU": ["HE2"],
+    "ASP": ["HD2"],
+    "HIS": ["HE2", "HD1"],
+}
 
 
 def topology_from_pdb(
     path: PathLike,
-    replace_missing_atoms=False,
-    use_canonical_names=True,
+    replace_missing_atoms: bool = False,
+    use_canonical_names: bool = True,
     unknown_molecules: list[Molecule] = [],
     residue_database: Mapping[str, CcdResidueDefinition] = CCD_RESIDUE_DEFINITION_CACHE,
-    synonyms=SYNONYMS,
+    synonyms: Mapping[str, Mapping[str, list[str]]] = SYNONYMS,
+    protonation_variants: Mapping[str, list[str]] = PROTEIN_PROTONATION_VARIANTS,
 ) -> Topology:
     path = Path(path)
     data = PdbData.parse_pdb(path.read_text().splitlines())
+    synonyms = SynonymDict(synonyms)
 
     molecules: list[PDBMolecule] = []
     current_molecule = PDBMolecule()
@@ -966,11 +1061,14 @@ def topology_from_pdb(
         # Note that for the CCD_RESIDUE_DEFINITION_CACHE, "not in" includes a check
         # for the residue names "UNL" and "UNK"
         if res_name not in residue_database:
-            residue = load_unknown_residue(data, res_atom_idcs, unknown_molecules)
+            residue = _load_unknown_residue(data, res_atom_idcs, unknown_molecules)
         else:
-            residue = load_residue_from_database(
+            residue = _load_residue_from_database(
                 data, res_atom_idcs, residue_database, synonyms
             )
+
+            if not replace_missing_atoms:
+                residue.titrate_added_atoms(protonation_variants)
 
         if (
             residue.properties["linking_type"] == "NON-POLYMER"
@@ -1000,7 +1098,7 @@ def topology_from_pdb(
     if not replace_missing_atoms:
         missing_atoms = []
         for molecule in molecules:
-            for atom in molecule.atoms:
+            for i, atom in enumerate(molecule.atoms):
                 if "pdb_index" not in atom.metadata:
                     missing_atoms.append(atom)
         if missing_atoms:
@@ -1009,8 +1107,7 @@ def topology_from_pdb(
     if not use_canonical_names:
         for molecule in molecules:
             for atom in molecule.atoms:
-                atom.metadata["canonical_name"] = atom.name
-                atom.name = atom.metadata.pop("used_synonym", atom.name)
+                atom.name = atom.metadata.get("used_synonym", atom.name)
 
     topology = Topology.from_molecules(
         [pdbmol.to_openff_molecule() for pdbmol in molecules]
