@@ -22,7 +22,7 @@ from networkx import Graph
 from openmm.app.internal.pdbx.reader.PdbxReader import PdbxReader
 
 from openff.toolkit import Molecule, Topology
-from openff.units import elements, unit
+from openff.units import Quantity, elements, unit
 
 
 class __UNSET__:
@@ -323,7 +323,7 @@ def unwrap(container: Iterable[T], msg: str = "") -> T:
 
 
 @dataclass
-class CcdAtomDefinition:
+class AtomDefinition:
     """
     Description of an atom in a residue from the Chemical Component Dictionary (CCD).
     """
@@ -340,7 +340,7 @@ class CcdAtomDefinition:
 
 
 @dataclass
-class CcdBondDefinition:
+class BondDefinition:
     """
     Description of a bond in a residue from the Chemical Component Dictionary (CCD).
     """
@@ -353,7 +353,7 @@ class CcdBondDefinition:
 
 
 @dataclass
-class CcdResidueDefinition:
+class ResidueDefinition:
     """
     Description of a residue from the Chemical Component Dictionary (CCD).
     """
@@ -361,8 +361,8 @@ class CcdResidueDefinition:
     residueName: str
     smiles: list[str]
     linking_type: str
-    atoms: list[CcdAtomDefinition]
-    bonds: list[CcdBondDefinition]
+    atoms: list[AtomDefinition]
+    bonds: list[BondDefinition]
 
     @classmethod
     def from_str(cls, s) -> Self:
@@ -395,7 +395,7 @@ class CcdResidueDefinition:
         stereoCol = atomData.getAttributeIndex("pdbx_stereo_config")
 
         atoms = [
-            CcdAtomDefinition(
+            AtomDefinition(
                 name=row[atomNameCol],
                 symbol=row[symbolCol][0:1].upper() + row[symbolCol][1:].lower(),
                 leaving=row[leavingCol] == "Y",
@@ -417,7 +417,7 @@ class CcdResidueDefinition:
             aromaticCol = bondData.getAttributeIndex("pdbx_aromatic_flag")
             stereoCol = bondData.getAttributeIndex("pdbx_stereo_config")
             bonds = [
-                CcdBondDefinition(
+                BondDefinition(
                     atom1=row[atom1Col],
                     atom2=row[atom2Col],
                     order=row[orderCol],
@@ -581,11 +581,19 @@ class PdbData:
     charge: list[int] = field(default_factory=list)
     terminated: list[bool] = field(default_factory=list)
     conects: list[set[int]] = field(default_factory=list)
+    cryst1_a: float | None = None
+    cryst1_b: float | None = None
+    cryst1_c: float | None = None
+    cryst1_alpha: float | None = None
+    cryst1_beta: float | None = None
+    cryst1_gamma: float | None = None
 
     def _append_coord_line(self, line: str):
         for field in dataclasses.fields(self):
-            getattr(self, field.name).append(__UNSET__)
-            assert getattr(self, field.name)[-1] is __UNSET__
+            value = getattr(self, field.name)
+            if hasattr(value, "append"):
+                value.append(__UNSET__)
+                assert value[-1] is __UNSET__
 
         self.model[-1] = None
         self.serial[-1] = int(line[6:11])
@@ -594,7 +602,7 @@ class PdbData:
         self.res_name[-1] = line[17:20].strip()
         self.chain_id[-1] = line[21].strip()
         self.res_seq[-1] = dec_hex(line[22:26])
-        self.i_code[-1] = line[26].strip() or ""
+        self.i_code[-1] = line[26].strip() or " "
         self.x[-1] = float(line[30:38])
         self.y[-1] = float(line[38:46])
         self.z[-1] = float(line[46:54])
@@ -607,7 +615,9 @@ class PdbData:
 
         # Ensure we've assigned a value to every field
         for field in dataclasses.fields(self):
-            assert getattr(self, field.name)[-1] is not __UNSET__
+            value = getattr(self, field.name)
+            if hasattr(value, "append"):
+                assert value[-1] is not __UNSET__
 
     @classmethod
     def parse_pdb(cls, lines: Iterable[str]) -> Self:
@@ -652,6 +662,13 @@ class PdbData:
                         break
                 else:
                     assert False, "last residue too big"
+            if line.startswith("CRYST1"):
+                data.cryst1_a = float(line[6:15])
+                data.cryst1_b = float(line[15:24])
+                data.cryst1_c = float(line[24:33])
+                data.cryst1_alpha = float(line[33:40])
+                data.cryst1_beta = float(line[40:47])
+                data.cryst1_gamma = float(line[47:54])
 
         return data
 
@@ -683,12 +700,12 @@ class PdbData:
         }
 
 
-class CcdCache(Mapping[str, CcdResidueDefinition]):
+class CcdCache(Mapping[str, ResidueDefinition]):
     def __init__(
         self,
         path: Path,
         preload: list[str] = [],
-        patches: dict[str, Callable[[CcdResidueDefinition], CcdResidueDefinition]] = {},
+        patches: dict[str, Callable[[ResidueDefinition], ResidueDefinition]] = {},
     ):
         self.path = path.resolve()
         self.path.mkdir(parents=True, exist_ok=True)
@@ -711,7 +728,7 @@ class CcdCache(Mapping[str, CcdResidueDefinition]):
             self.patches!r
         })"
 
-    def __getitem__(self, key: str) -> CcdResidueDefinition:
+    def __getitem__(self, key: str) -> ResidueDefinition:
         res_name = key.upper()
         if res_name in self.definitions:
             return self.definitions[res_name]
@@ -725,8 +742,8 @@ class CcdCache(Mapping[str, CcdResidueDefinition]):
 
     def _add_definition_from_str(
         self, s: str, res_name: str | None = None
-    ) -> CcdResidueDefinition:
-        definition = CcdResidueDefinition.from_str(s)
+    ) -> ResidueDefinition:
+        definition = ResidueDefinition.from_str(s)
         if res_name is None:
             res_name = definition.residueName.upper()
 
@@ -769,7 +786,7 @@ class CcdCache(Mapping[str, CcdResidueDefinition]):
         return self.definitions.__len__()
 
 
-def set_peptide_linking_type(res: CcdResidueDefinition) -> CcdResidueDefinition:
+def set_peptide_linking_type(res: ResidueDefinition) -> ResidueDefinition:
     res.linking_type = "PEPTIDE LINKING"
 
     if res.residueName == "ACE":
@@ -781,13 +798,14 @@ def set_peptide_linking_type(res: CcdResidueDefinition) -> CcdResidueDefinition:
     return res
 
 
+# TODO: Replace these patches with CONECT records?
 CCD_RESIDUE_DEFINITION_CACHE = CcdCache(
     Path(__file__).parent / "../../.ccd_cache",
     patches={"ACE": set_peptide_linking_type, "NME": set_peptide_linking_type},
 )
 
 # TODO: Fill in this data
-LINKING_TYPES: dict[str, CcdBondDefinition | None] = {
+LINKING_TYPES: dict[str, BondDefinition | None] = {
     # "D-beta-peptide, C-gamma linking".upper(): [],
     # "D-gamma-peptide, C-delta linking".upper(): [],
     # "D-peptide COOH carboxy terminus".upper(): [],
@@ -805,7 +823,7 @@ LINKING_TYPES: dict[str, CcdBondDefinition | None] = {
     # "L-gamma-peptide, C-delta linking".upper(): [],
     # "L-peptide COOH carboxy terminus".upper(): [],
     # "L-peptide NH3 amino terminus".upper(): [],
-    "L-peptide linking".upper(): CcdBondDefinition(
+    "L-peptide linking".upper(): BondDefinition(
         atom1="C", atom2="N", order="SING", aromatic=False, stereo=None
     ),
     # "L-saccharide".upper(): [],
@@ -816,7 +834,7 @@ LINKING_TYPES: dict[str, CcdBondDefinition | None] = {
     # "RNA linking".upper(): [],
     "non-polymer".upper(): None,
     # "other".upper(): [],
-    "peptide linking".upper(): CcdBondDefinition(
+    "peptide linking".upper(): BondDefinition(
         atom1="C", atom2="N", order="SING", aromatic=False, stereo=None
     ),
     # "peptide-like".upper(): [],
@@ -826,24 +844,24 @@ LINKING_TYPES: dict[str, CcdBondDefinition | None] = {
 
 class SynonymDict(Mapping):
     def __init__(self, d: Mapping[str, Mapping[str, list[str]]]):
-        self.forward = d
+        self.to_synonyms = d
         self.to_canonical = {}
         for resname, synonyms in d.items():
             reverse_resname_dict = {}
             self.to_canonical[resname] = reverse_resname_dict
-            for ccdname, pdbnames in synonyms.items():
-                reverse_resname_dict[ccdname] = ccdname
-                for pdbname in pdbnames:
-                    reverse_resname_dict[pdbname] = ccdname
+            for canonical_name, pdb_names in synonyms.items():
+                reverse_resname_dict[canonical_name] = canonical_name
+                for pdb_name in pdb_names:
+                    reverse_resname_dict[pdb_name] = canonical_name
 
     def __getitem__(self, key: str) -> Mapping[str, list[str]]:
-        return self.forward.__getitem__(key)
+        return self.to_synonyms.__getitem__(key)
 
     def __iter__(self) -> Iterator[str]:
-        return self.forward.__iter__()
+        return self.to_synonyms.__iter__()
 
     def __len__(self) -> int:
-        return self.forward.__len__()
+        return self.to_synonyms.__len__()
 
     def get_canonical_name(self, res_name: str, atom_name: str) -> str:
         return self.to_canonical.get(res_name, {}).get(atom_name, atom_name)
@@ -854,7 +872,7 @@ class SynonymDict(Mapping):
         if canonical_name in match_in:
             return canonical_name
 
-        for synonym in self.forward.get(res_name, {}).get(canonical_name, []):
+        for synonym in self.to_synonyms.get(res_name, {}).get(canonical_name, []):
             if synonym in match_in:
                 return synonym
 
@@ -862,7 +880,7 @@ class SynonymDict(Mapping):
 
     def format_with_synonyms(self, res_name: str, atom_names: set[str]) -> str:
         atoms = []
-        residue_synonyms = self.forward.get(res_name, {})
+        residue_synonyms = self.to_synonyms.get(res_name, {})
         for atom_name in atom_names:
             atom_synonyms = residue_synonyms.get(atom_name, [])
             if len(atom_synonyms) > 1:
@@ -896,7 +914,8 @@ def _load_unknown_residue(
                 "residue_name": data.res_name[pdb_index],
                 "leaving": False,
                 "pdb_index": pdb_index,
-                "residue_number": data.res_seq[pdb_index],
+                "residue_number": str(data.res_seq[pdb_index]),
+                "res_seq": data.res_seq[pdb_index],
                 "insertion_code": data.i_code[pdb_index],
                 "chain_id": data.chain_id[pdb_index],
                 "atom_serial": data.serial[pdb_index],
@@ -956,7 +975,7 @@ def _load_unknown_residue(
             break
     else:
         res_name = pdbmol.atoms[0].metadata["residue_name"]
-        res_seq = pdbmol.atoms[0].metadata["residue_number"]
+        res_seq = pdbmol.atoms[0].metadata["res_seq"]
         chain_id = pdbmol.atoms[0].metadata["chain_id"]
         raise ValueError(
             f"Unknown residue {chain_id}:{res_name}#{res_seq} could not be assigned chemistry from unknown_molecules"
@@ -968,7 +987,7 @@ def _load_unknown_residue(
 def _load_residue_from_database(
     data: PdbData,
     res_atom_idcs: list[int],
-    residue_database: Mapping[str, CcdResidueDefinition],
+    residue_database: Mapping[str, ResidueDefinition],
     synonyms: SynonymDict,
 ) -> PDBMolecule:
     prototype_index = res_atom_idcs[0]
@@ -980,7 +999,8 @@ def _load_residue_from_database(
     ccd_residue_atom_names = {atom.name for atom in residue.atoms}
 
     residue_wide_metadata = {
-        "residue_number": data.res_seq[prototype_index],
+        "residue_number": str(data.res_seq[prototype_index]),
+        "res_seq": data.res_seq[prototype_index],
         "insertion_code": data.i_code[prototype_index],
         "chain_id": data.chain_id[prototype_index],
     }
@@ -1018,7 +1038,24 @@ def _load_residue_from_database(
     return residue
 
 
-SYNONYMS = {
+def cryst_to_box_vectors(
+    a: float, b: float, c: float, alpha: float, beta: float, gamma: float
+) -> Quantity:
+    from openmm.app.internal.unitcell import computePeriodicBoxVectors
+    from openmm.unit import angstrom, degrees, nanometer
+
+    box_vectors = computePeriodicBoxVectors(
+        a * angstrom,
+        b * angstrom,
+        c * angstrom,
+        alpha * degrees,
+        beta * degrees,
+        gamma * degrees,
+    )
+    return box_vectors.value_in_unit(nanometer) * unit.nanometer
+
+
+ATOM_NAME_SYNONYMS = {
     "NME": {"HN2": ["H"]},
     "NA": {"NA": ["Na"]},
     "CL": {"CL": ["Cl"]},
@@ -1036,13 +1073,13 @@ def topology_from_pdb(
     replace_missing_atoms: bool = False,
     use_canonical_names: bool = True,
     unknown_molecules: list[Molecule] = [],
-    residue_database: Mapping[str, CcdResidueDefinition] = CCD_RESIDUE_DEFINITION_CACHE,
-    synonyms: Mapping[str, Mapping[str, list[str]]] = SYNONYMS,
+    residue_database: Mapping[str, ResidueDefinition] = CCD_RESIDUE_DEFINITION_CACHE,
+    atom_name_synonyms: Mapping[str, Mapping[str, list[str]]] = ATOM_NAME_SYNONYMS,
     protonation_variants: Mapping[str, list[str]] = PROTEIN_PROTONATION_VARIANTS,
 ) -> Topology:
     path = Path(path)
     data = PdbData.parse_pdb(path.read_text().splitlines())
-    synonyms = SynonymDict(synonyms)
+    atom_name_synonyms = SynonymDict(atom_name_synonyms)
 
     molecules: list[PDBMolecule] = []
     current_molecule = PDBMolecule()
@@ -1064,7 +1101,7 @@ def topology_from_pdb(
             residue = _load_unknown_residue(data, res_atom_idcs, unknown_molecules)
         else:
             residue = _load_residue_from_database(
-                data, res_atom_idcs, residue_database, synonyms
+                data, res_atom_idcs, residue_database, atom_name_synonyms
             )
 
             if not replace_missing_atoms:
@@ -1112,6 +1149,24 @@ def topology_from_pdb(
     topology = Topology.from_molecules(
         [pdbmol.to_openff_molecule() for pdbmol in molecules]
     )
+    if (
+        data.cryst1_a is not None
+        and data.cryst1_b is not None
+        and data.cryst1_c is not None
+        and data.cryst1_alpha is not None
+        and data.cryst1_beta is not None
+        and data.cryst1_gamma is not None
+    ):
+        topology.box_vectors = cryst_to_box_vectors(
+            data.cryst1_a,
+            data.cryst1_b,
+            data.cryst1_c,
+            data.cryst1_alpha,
+            data.cryst1_beta,
+            data.cryst1_gamma,
+        )
+    for offmol in topology.molecules:
+        offmol.add_default_hierarchy_schemes()
 
     return topology
 
@@ -1123,7 +1178,7 @@ class MissingAtomsFromPDBError(ValueError):
             chain = atom.metadata["chain_id"]
             res_name = atom.metadata["residue_name"]
             icode = atom.metadata["insertion_code"]
-            res_seq = atom.metadata["residue_number"]
+            res_seq = atom.metadata["res_seq"]
 
             residue = f"{res_name}#{res_seq:0>4}{icode}"
             if chain:
