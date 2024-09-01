@@ -798,7 +798,7 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         return self.definitions.__len__()
 
 
-def set_peptide_linking_type(res: ResidueDefinition) -> list[ResidueDefinition]:
+def fix_caps(res: ResidueDefinition) -> list[ResidueDefinition]:
     res.linking_type = "PEPTIDE LINKING"
 
     if res.residueName == "ACE":
@@ -810,10 +810,67 @@ def set_peptide_linking_type(res: ResidueDefinition) -> list[ResidueDefinition]:
     return [res]
 
 
+def add_protonation_variants(res: ResidueDefinition) -> list[ResidueDefinition]:
+    residue_definitions = [res]
+
+    for variant_smiles in PROTONATION_VARIANTS[res.residueName]:
+        variant = Molecule.from_smiles(variant_smiles)
+        mappings = variant.properties["atom_map"]
+        atoms = []
+        for i, variant_atom in enumerate(variant.atoms):
+            # TODO: Handle case where extra atom is added in variant
+            db_atom = res.atoms[mappings[i] - 1]
+            new_atom = AtomDefinition(
+                name=db_atom.name,
+                symbol=variant_atom.symbol,
+                leaving=db_atom.leaving,
+                x=db_atom.x,
+                y=db_atom.y,
+                z=db_atom.z,
+                charge=variant_atom.formal_charge,
+                aromatic=variant_atom.is_aromatic,
+                stereo=variant_atom.stereochemistry,
+            )
+            atoms.append(new_atom)
+        bonds = []
+        for variant_bond in variant.bonds:
+            new_bond = BondDefinition(
+                atom1=atoms[variant_bond.atom1_index].name,
+                atom2=atoms[variant_bond.atom2_index].name,
+                order={1: "SING", 2: "DOUB", 3: "TRIP"}[variant_bond.bond_order],
+                aromatic=variant_bond.is_aromatic,
+                stereo=variant_bond.stereochemistry,
+            )
+            bonds.append(new_bond)
+        residue_definitions.append(
+            ResidueDefinition(
+                residueName=res.residueName,
+                smiles=[variant_smiles],
+                linking_type=res.linking_type,
+                atoms=atoms,
+                bonds=bonds,
+            )
+        )
+
+    return residue_definitions
+
+
+PROTONATION_VARIANTS = {
+    "HIS": [
+        "[N:1]([C@@:2]([C:5]([C:6]1=[C:8]([H:18])[N:10]([H:20])[C:9]([H:19])=[N:7]1)([H:15])[H:16])([C:3]([O:11][H:21])=[O:4])[H:14])([H:12])[H:13]",
+        "[N:1]([C@@:2]([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N:7]1[H:17])([H:15])[H:16])([C:3]([O:11][H:21])=[O:4])[H:14])([H:12])[H:13]",
+        "[N:1]([C@@:2]([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N-:7]1)([H:15])[H:16])([C:3]([O:11][H:21])=[O:4])[H:14])([H:12])[H:13]",
+    ]
+}
+
 # TODO: Replace these patches with CONECT records?
 CCD_RESIDUE_DEFINITION_CACHE = CcdCache(
     Path(__file__).parent / "../../.ccd_cache",
-    patches={"ACE": set_peptide_linking_type, "NME": set_peptide_linking_type},
+    patches={
+        "ACE": fix_caps,
+        "NME": fix_caps,
+        **{key: add_protonation_variants for key in PROTONATION_VARIANTS},
+    },
 )
 
 # TODO: Fill in this data
@@ -1052,7 +1109,7 @@ def _load_residue_from_database(
                 atom_specific_metadata = {}
 
             atom.metadata.update(residue_wide_metadata | atom_specific_metadata)
-            residues.append(residue_definition)
+        residues.append(residue_definition)
 
     if len(residues) == 0:
         raise NoMatchingResidueDefinitionError(
@@ -1066,10 +1123,20 @@ def _load_residue_from_database(
         )
 
     # Choose the residue with the most atoms found in the PDB
-    residue = sorted(
+    def key(residue: PDBMolecule) -> tuple[int, int]:
+        coverage = 0
+        leavers = 0
+        for atom in residue.atoms:
+            coverage += "pdb_index" in atom.metadata
+            leavers += atom.metadata.get("leavers", False)
+        excess_atoms = residue.n_atoms - coverage - leavers
+        return (-coverage, excess_atoms)
+
+    sorted_residues = sorted(
         residues,
-        key=lambda res: sum(1 for atom in res.atoms if "pdb_index" in atom.metadata),
-    )[0]
+        key=key,
+    )
+    residue = sorted_residues[0]
 
     residue.sort_atoms_by_metadata("pdb_index")
 
@@ -1203,7 +1270,9 @@ def topology_from_pdb(
 
 class MissingAtomsFromPDBError(ValueError):
     def __init__(self, missing_atoms: list[PDBAtom]) -> None:
-        message = ["The following atoms from the CCD were missing from the PDB file:"]
+        message = [
+            "The following atoms from the residue database were missing from the PDB file:"
+        ]
         for atom in missing_atoms:
             chain = atom.metadata["chain_id"]
             res_name = atom.metadata["residue_name"]
@@ -1245,3 +1314,6 @@ class NoMatchingResidueDefinitionError(ValueError):
             message.append(
                 f"    {i}: {unmatched_names} were not among {expected_names}"
             )
+
+        self.unmatched_atoms = unmatched_atoms
+        super().__init__("\n".join(message))
