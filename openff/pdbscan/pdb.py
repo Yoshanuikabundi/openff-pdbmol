@@ -447,7 +447,7 @@ class ResidueDefinition:
         )
         return ret
 
-    def to_molecule(self) -> Molecule:
+    def to_openff_molecule(self) -> Molecule:
         molecule = Molecule()
         atoms = {}
         for atom in self.atoms:
@@ -814,7 +814,7 @@ def add_protonation_variants(res: ResidueDefinition) -> list[ResidueDefinition]:
     residue_definitions = [res]
 
     for variant_smiles in PROTONATION_VARIANTS[res.residueName]:
-        variant = Molecule.from_smiles(variant_smiles)
+        variant = Molecule.from_smiles(variant_smiles, allow_undefined_stereo=True)
         mappings = variant.properties["atom_map"]
         atoms = []
         for i, variant_atom in enumerate(variant.atoms):
@@ -860,7 +860,25 @@ PROTONATION_VARIANTS = {
         "[N:1]([C@@:2]([C:5]([C:6]1=[C:8]([H:18])[N:10]([H:20])[C:9]([H:19])=[N:7]1)([H:15])[H:16])([C:3]([O:11][H:21])=[O:4])[H:14])([H:12])[H:13]",
         "[N:1]([C@@:2]([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N:7]1[H:17])([H:15])[H:16])([C:3]([O:11][H:21])=[O:4])[H:14])([H:12])[H:13]",
         "[N:1]([C@@:2]([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N-:7]1)([H:15])[H:16])([C:3]([O:11][H:21])=[O:4])[H:14])([H:12])[H:13]",
-    ]
+    ],
+    "GLU": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:10][H:19])([C:5]([C:6]([C:7](=[O:8])[O-:9])([H:16])[H:17])([H:14])[H:15])[H:13])([H:11])[H:12]",
+    ],
+    "ASP": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:9][H:16])([C:5]([C:6](=[O:7])[O-:8])([H:13])[H:14])[H:12])([H:10])[H:11]"
+    ],
+    "LYS": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:10][H:25])([C:5]([C:6]([C:7]([C:8]([N:9]([H:22])([H:23]))([H:20])[H:21])([H:18])[H:19])([H:16])[H:17])([H:14])[H:15])[H:13])([H:11])[H:12]"
+    ],
+    "ARG": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:12][H:27])([C:5]([C:6]([C:7]([N:8]([C:9]([N:10]([H:23])[H:24])=[N:11][H:25])[H:22])([H:20])[H:21])([H:18])[H:19])([H:16])[H:17])[H:15])([H:13])[H:14]"
+    ],
+    "CYS": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:7][H:14])([C:5]([S-:6])([H:11])[H:12])[H:10])([H:8])[H:9]"
+    ],
+    "TYR": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:13][H:24])([C:5]([c:6]1[c:7]([H:19])[c:9]([H:21])[c:11]([O-:12])[c:10]([H:22])[c:8]1[H:20])([H:17])[H:18])[H:16])([H:14])[H:15]"
+    ],
 }
 
 # TODO: Replace these patches with CONECT records?
@@ -1022,6 +1040,7 @@ def _load_unknown_residue(
             bond_stereochemistry_matching=False,
             strip_pyrimidal_n_atom_stereo=True,
         )
+        assert mapping is not None
         if match_found:
             reverse_map = {}
             for i, atom in enumerate(pdbmol.atoms):
