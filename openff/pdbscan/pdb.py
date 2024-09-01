@@ -2,6 +2,7 @@ import dataclasses
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import cached_property, lru_cache
 from io import StringIO
 from os import PathLike
 from pathlib import Path
@@ -331,6 +332,11 @@ def unwrap(container: Iterable[T], msg: str = "") -> T:
     raise ValueError(msg + "container has multiple elements")
 
 
+def flatten(container: Iterable[Iterable[T]]) -> Iterable[T]:
+    for inner in container:
+        yield from inner
+
+
 @dataclass
 class AtomDefinition:
     """
@@ -338,6 +344,7 @@ class AtomDefinition:
     """
 
     name: str
+    synonyms: list[str]
     symbol: str
     leaving: bool
     x: float
@@ -374,7 +381,8 @@ class ResidueDefinition:
     bonds: list[BondDefinition]
 
     @classmethod
-    def from_str(cls, s) -> Self:
+    def from_ccd_str(cls, s) -> Self:
+        # TODO: Handle residues like CL with a single atom properly (no tables)
         data = []
         with StringIO(s) as file:
             PdbxReader(file).read(data)
@@ -394,6 +402,7 @@ class ResidueDefinition:
 
         atomData = block.getObj("chem_comp_atom")
         atomNameCol = atomData.getAttributeIndex("atom_id")
+        altAtomNameCol = atomData.getAttributeIndex("alt_atom_id")
         symbolCol = atomData.getAttributeIndex("type_symbol")
         leavingCol = atomData.getAttributeIndex("pdbx_leaving_atom_flag")
         xCol = atomData.getAttributeIndex("pdbx_model_Cartn_x_ideal")
@@ -406,6 +415,9 @@ class ResidueDefinition:
         atoms = [
             AtomDefinition(
                 name=row[atomNameCol],
+                synonyms=[row[altAtomNameCol]]
+                if row[altAtomNameCol] != row[atomNameCol]
+                else [],
                 symbol=row[symbolCol][0:1].upper() + row[symbolCol][1:].lower(),
                 leaving=row[leavingCol] == "Y",
                 x=float(row[xCol]),
@@ -532,6 +544,53 @@ class ResidueDefinition:
         )
 
         return molecule
+
+    @cached_property
+    def _name_to_canonical_name(self) -> dict[str, str]:
+        mapping = {}
+        canonical_names = {atom.name for atom in self.atoms}
+        for atom in self.atoms:
+            for synonym in atom.synonyms:
+                if synonym in mapping and mapping[synonym] != atom.name:
+                    raise ValueError(
+                        f"synonym {
+                            synonym
+                        } degenerately defined for canonical names {
+                            mapping[synonym]
+                        } and {
+                            atom.name
+                        } in residue {
+                            self.residueName
+                        }"
+                    )
+                if synonym in canonical_names:
+                    raise ValueError(f"synonym {
+                        synonym
+                    } of atom {
+                        atom.name
+                    } clashes with another canonical name in residue {
+                        self.residueName
+                    }")
+                mapping[synonym] = atom.name
+        return mapping
+
+    def get_canonical_name(self, name: str) -> str:
+        return self._name_to_canonical_name.get(name, name)
+
+    def format_names_with_synonyms(self, res_name: str, atom_names: set[str]) -> str:
+        atoms = []
+        residue_synonyms = {atom.name: atom.synonyms for atom in self.atoms}
+        for atom_name in atom_names:
+            atom_synonyms = residue_synonyms.get(atom_name, [])
+            if len(atom_synonyms) > 1:
+                atoms.append(
+                    f"{atom_name} (or one of its synonyms {','.join(atom_synonyms)})"
+                )
+            if len(atom_synonyms) == 1:
+                atoms.append(f"{atom_name} (or its synonym {atom_synonyms[0]})")
+            else:
+                atoms.append(atom_name)
+        return ", ".join(atoms)
 
 
 def dec_hex(s: str) -> int:
@@ -752,12 +811,16 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
     def _add_definition_from_str(
         self, s: str, res_name: str | None = None
     ) -> list[ResidueDefinition]:
-        definition = ResidueDefinition.from_str(s)
+        definition = ResidueDefinition.from_ccd_str(s)
         if res_name is None:
             res_name = definition.residueName.upper()
 
-        patch = self.patches.get(definition.residueName.upper(), lambda x: [x])
-        patched_definitions = patch(definition)
+        patch_res = self.patches.get(definition.residueName.upper(), lambda x: [x])
+        patch_all = self.patches.get("*", lambda x: [x])
+        patched_definitions = list(patch_all(definition))
+        patched_definitions = list(
+            flatten(patch_res(res) for res in patched_definitions)
+        )
 
         assert all(
             res_name == definition.residueName.upper()
@@ -810,6 +873,33 @@ def fix_caps(res: ResidueDefinition) -> list[ResidueDefinition]:
     return [res]
 
 
+PROTONATION_VARIANTS = {
+    "HIS": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]([H:20])[C:9]([H:19])=[N:7]1)([H:15])[H:16])[H:14])([H:12])[H:13]",
+        "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N:7]1[H:17])([H:15])[H:16])[H:14])([H:12])[H:13]",
+        "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N-:7]1)([H:15])[H:16])[H:14])([H:12])[H:13]",
+    ],
+    "GLU": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:10][H:19])([C:5]([C:6]([C:7](=[O:8])[O-:9])([H:16])[H:17])([H:14])[H:15])[H:13])([H:11])[H:12]",
+    ],
+    "ASP": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:9][H:16])([C:5]([C:6](=[O:7])[O-:8])([H:13])[H:14])[H:12])([H:10])[H:11]"
+    ],
+    "LYS": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:10][H:25])([C:5]([C:6]([C:7]([C:8]([N:9]([H:22])([H:23]))([H:20])[H:21])([H:18])[H:19])([H:16])[H:17])([H:14])[H:15])[H:13])([H:11])[H:12]"
+    ],
+    "ARG": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:12][H:27])([C:5]([C:6]([C:7]([N:8]([C:9]([N:10]([H:23])[H:24])=[N:11][H:25])[H:22])([H:20])[H:21])([H:18])[H:19])([H:16])[H:17])[H:15])([H:13])[H:14]"
+    ],
+    "CYS": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:7][H:14])([C:5]([S-:6])([H:11])[H:12])[H:10])([H:8])[H:9]"
+    ],
+    "TYR": [
+        "[N:1]([C@:2]([C:3](=[O:4])[O:13][H:24])([C:5]([c:6]1[c:7]([H:19])[c:9]([H:21])[c:11]([O-:12])[c:10]([H:22])[c:8]1[H:20])([H:17])[H:18])[H:16])([H:14])[H:15]"
+    ],
+}
+
+
 def add_protonation_variants(res: ResidueDefinition) -> list[ResidueDefinition]:
     residue_definitions = [res]
 
@@ -822,6 +912,7 @@ def add_protonation_variants(res: ResidueDefinition) -> list[ResidueDefinition]:
             db_atom = res.atoms[mappings[i] - 1]
             new_atom = AtomDefinition(
                 name=db_atom.name,
+                synonyms=db_atom.synonyms,
                 symbol=variant_atom.symbol,
                 leaving=db_atom.leaving,
                 x=db_atom.x,
@@ -855,40 +946,87 @@ def add_protonation_variants(res: ResidueDefinition) -> list[ResidueDefinition]:
     return residue_definitions
 
 
-PROTONATION_VARIANTS = {
-    "HIS": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]([H:20])[C:9]([H:19])=[N:7]1)([H:15])[H:16])[H:14])([H:12])[H:13]",
-        "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N:7]1[H:17])([H:15])[H:16])[H:14])([H:12])[H:13]",
-        "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N-:7]1)([H:15])[H:16])[H:14])([H:12])[H:13]",
-    ],
-    "GLU": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:10][H:19])([C:5]([C:6]([C:7](=[O:8])[O-:9])([H:16])[H:17])([H:14])[H:15])[H:13])([H:11])[H:12]",
-    ],
-    "ASP": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:9][H:16])([C:5]([C:6](=[O:7])[O-:8])([H:13])[H:14])[H:12])([H:10])[H:11]"
-    ],
-    "LYS": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:10][H:25])([C:5]([C:6]([C:7]([C:8]([N:9]([H:22])([H:23]))([H:20])[H:21])([H:18])[H:19])([H:16])[H:17])([H:14])[H:15])[H:13])([H:11])[H:12]"
-    ],
-    "ARG": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:12][H:27])([C:5]([C:6]([C:7]([N:8]([C:9]([N:10]([H:23])[H:24])=[N:11][H:25])[H:22])([H:20])[H:21])([H:18])[H:19])([H:16])[H:17])[H:15])([H:13])[H:14]"
-    ],
-    "CYS": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:7][H:14])([C:5]([S-:6])([H:11])[H:12])[H:10])([H:8])[H:9]"
-    ],
-    "TYR": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:13][H:24])([C:5]([c:6]1[c:7]([H:19])[c:9]([H:21])[c:11]([O-:12])[c:10]([H:22])[c:8]1[H:20])([H:17])[H:18])[H:16])([H:14])[H:15]"
-    ],
+ATOM_NAME_SYNONYMS = {
+    "NME": {"HN2": ["H"]},
+    "NA": {"NA": ["Na"]},
+    "CL": {"CL": ["Cl"]},
 }
+
+
+def add_synonyms(res: ResidueDefinition) -> list[ResidueDefinition]:
+    for atom in res.atoms:
+        atom.synonyms.extend(ATOM_NAME_SYNONYMS[res.residueName].get(atom.name, []))
+    return [res]
+
+
+def disambiguate_alt_ids(res: ResidueDefinition) -> list[ResidueDefinition]:
+    """
+    CCD patch: put alt atom ids in their own residue definitions if needed
+
+    This patch should be run before other patches that add synonyms, as it
+    assumes that there is at most one synonym that came from the CCD alt id
+    flag.
+
+    Some CCD residues (like GLY) have alternative atom IDs that clash with
+    canonical IDs for a different atom. This breaks synonyms because the
+    clashing alternate ID is never assigned; the PDB file is interpreted as
+    having two copies of the canonical ID atom. To fix this, we just split
+    residue definitions with this clashing problem into two definitions, one
+    with the canonical IDs and the other with the alternates.
+    """
+    clashes = []
+    canonical_names = {atom.name for atom in res.atoms}
+    for i, atom in enumerate(res.atoms):
+        for synonym in atom.synonyms:
+            if synonym in canonical_names:
+                clashes.append(i)
+
+    if clashes:
+        res2 = deepcopy(res)
+        old_to_new = {}
+        for atom in res2.atoms:
+            old_to_new[atom.name] = atom.name
+            if atom.synonyms:
+                synonym = unwrap(atom.synonyms)
+                old_to_new[atom.name] = synonym
+                atom.name = synonym
+                atom.synonyms = []
+        for bond in res2.bonds:
+            bond.atom1 = old_to_new[bond.atom1]
+            bond.atom2 = old_to_new[bond.atom2]
+        for clash in clashes:
+            res.atoms[clash].synonyms = []
+        return [res, res2]
+    else:
+        return [res]
+
+
+def combine_patches(
+    *patches: dict[str, Callable[[ResidueDefinition], list[ResidueDefinition]]],
+) -> dict[str, Callable[[ResidueDefinition], list[ResidueDefinition]]]:
+    combined = {}
+    for patch in patches:
+        for key, fn in patch.items():
+            if key in combined:
+                existing_fn = combined[key]
+                combined[key] = lambda x: list(flatten(fn(y) for y in existing_fn(x)))
+            else:
+                combined[key] = fn
+    return combined
+
 
 # TODO: Replace these patches with CONECT records?
 CCD_RESIDUE_DEFINITION_CACHE = CcdCache(
     Path(__file__).parent / "../../.ccd_cache",
-    patches={
-        "ACE": fix_caps,
-        "NME": fix_caps,
-        **{key: add_protonation_variants for key in PROTONATION_VARIANTS},
-    },
+    patches=combine_patches(
+        {"*": disambiguate_alt_ids},
+        {
+            "ACE": fix_caps,
+            "NME": fix_caps,
+        },
+        {key: add_protonation_variants for key in PROTONATION_VARIANTS},
+        {key: add_synonyms for key in ATOM_NAME_SYNONYMS},
+    ),
 )
 
 # TODO: Fill in this data
@@ -927,58 +1065,6 @@ LINKING_TYPES: dict[str, BondDefinition | None] = {
     # "peptide-like".upper(): [],
     # "saccharide".upper(): [],
 }
-
-
-class SynonymDict(Mapping):
-    def __init__(self, d: Mapping[str, Mapping[str, list[str]]]):
-        self.to_synonyms = d
-        self.to_canonical = {}
-        for resname, synonyms in d.items():
-            reverse_resname_dict = {}
-            self.to_canonical[resname] = reverse_resname_dict
-            for canonical_name, pdb_names in synonyms.items():
-                reverse_resname_dict[canonical_name] = canonical_name
-                for pdb_name in pdb_names:
-                    reverse_resname_dict[pdb_name] = canonical_name
-
-    def __getitem__(self, key: str) -> Mapping[str, list[str]]:
-        return self.to_synonyms.__getitem__(key)
-
-    def __iter__(self) -> Iterator[str]:
-        return self.to_synonyms.__iter__()
-
-    def __len__(self) -> int:
-        return self.to_synonyms.__len__()
-
-    def get_canonical_name(self, res_name: str, atom_name: str) -> str:
-        return self.to_canonical.get(res_name, {}).get(atom_name, atom_name)
-
-    def find_synonym(
-        self, res_name: str, canonical_name: str, match_in: set[str]
-    ) -> str | None:
-        if canonical_name in match_in:
-            return canonical_name
-
-        for synonym in self.to_synonyms.get(res_name, {}).get(canonical_name, []):
-            if synonym in match_in:
-                return synonym
-
-        return None
-
-    def format_with_synonyms(self, res_name: str, atom_names: set[str]) -> str:
-        atoms = []
-        residue_synonyms = self.to_synonyms.get(res_name, {})
-        for atom_name in atom_names:
-            atom_synonyms = residue_synonyms.get(atom_name, [])
-            if len(atom_synonyms) > 1:
-                atoms.append(
-                    f"{atom_name} (or one of its synonyms {','.join(atom_synonyms)})"
-                )
-            if len(atom_synonyms) == 1:
-                atoms.append(f"{atom_name} (or its synonym {atom_synonyms[0]})")
-            else:
-                atoms.append(atom_name)
-        return ", ".join(atoms)
 
 
 def _load_unknown_residue(
@@ -1076,7 +1162,6 @@ def _load_residue_from_database(
     data: PdbData,
     res_atom_idcs: list[int],
     residue_database: Mapping[str, list[ResidueDefinition]],
-    synonyms: SynonymDict,
 ) -> PDBMolecule:
     prototype_index = res_atom_idcs[0]
 
@@ -1090,16 +1175,17 @@ def _load_residue_from_database(
         "insertion_code": i_code,
         "chain_id": chain_id,
     }
-    canonical_name_to_index = {
-        synonyms.get_canonical_name(res_name, data.name[i]): i for i in res_atom_idcs
-    }
 
     residues: list[PDBMolecule] = []
     unmatched_atoms = []
-    for residue_definition in map(
-        ResidueDefinition.to_pdb_molecule, residue_database[res_name]
-    ):
-        res_def_atom_names = {atom.name for atom in residue_definition.atoms}
+    for residue_definition in residue_database[res_name]:
+        residue = residue_definition.to_pdb_molecule()
+        canonical_name_to_index = {
+            residue_definition.get_canonical_name(data.name[i]): i
+            for i in res_atom_idcs
+        }
+
+        res_def_atom_names = {atom.name for atom in residue.atoms}
 
         unmatched_atoms.append([])
         for name, index in canonical_name_to_index.items():
@@ -1112,7 +1198,7 @@ def _load_residue_from_database(
             # So skip it and try the next one
             continue
 
-        for atom in residue_definition.atoms:
+        for atom in residue.atoms:
             if atom.name in canonical_name_to_index:
                 pdb_index = canonical_name_to_index[atom.name]
                 atom.x = data.x[pdb_index]
@@ -1128,7 +1214,7 @@ def _load_residue_from_database(
                 atom_specific_metadata = {}
 
             atom.metadata.update(residue_wide_metadata | atom_specific_metadata)
-        residues.append(residue_definition)
+        residues.append(residue)
 
     if len(residues) == 0:
         raise NoMatchingResidueDefinitionError(
@@ -1138,7 +1224,6 @@ def _load_residue_from_database(
             i_code,
             unmatched_atoms,
             residue_database[res_name],
-            synonyms,
         )
 
     # Choose the residue with the most atoms found in the PDB
@@ -1179,13 +1264,6 @@ def cryst_to_box_vectors(
     return box_vectors.value_in_unit(nanometer) * unit.nanometer
 
 
-ATOM_NAME_SYNONYMS = {
-    "NME": {"HN2": ["H"]},
-    "NA": {"NA": ["Na"]},
-    "CL": {"CL": ["Cl"]},
-}
-
-
 def topology_from_pdb(
     path: PathLike,
     replace_missing_atoms: bool = False,
@@ -1194,11 +1272,9 @@ def topology_from_pdb(
     residue_database: Mapping[
         str, list[ResidueDefinition]
     ] = CCD_RESIDUE_DEFINITION_CACHE,
-    atom_name_synonyms: Mapping[str, Mapping[str, list[str]]] = ATOM_NAME_SYNONYMS,
 ) -> Topology:
     path = Path(path)
     data = PdbData.parse_pdb(path.read_text().splitlines())
-    atom_name_synonyms = SynonymDict(atom_name_synonyms)
 
     molecules: list[PDBMolecule] = []
     current_molecule = PDBMolecule()
@@ -1219,9 +1295,7 @@ def topology_from_pdb(
         if res_name not in residue_database:
             residue = _load_unknown_residue(data, res_atom_idcs, unknown_molecules)
         else:
-            residue = _load_residue_from_database(
-                data, res_atom_idcs, residue_database, atom_name_synonyms
-            )
+            residue = _load_residue_from_database(data, res_atom_idcs, residue_database)
 
         if (
             residue.properties["linking_type"] == "NON-POLYMER"
@@ -1316,7 +1390,6 @@ class NoMatchingResidueDefinitionError(ValueError):
         i_code: str,
         unmatched_atoms: list[list[str]],
         residue_definitions: list[ResidueDefinition],
-        synonyms: SynonymDict,
     ):
         message = [
             f"No residue definitions covered all atoms in {res_name}#{res_seq}{i_code.strip()}:{chain_id}",
@@ -1327,7 +1400,7 @@ class NoMatchingResidueDefinitionError(ValueError):
             zip(unmatched_atoms, residue_definitions)
         ):
             defined_canonical_names = {atom.name for atom in residue.atoms}
-            expected_names = synonyms.format_with_synonyms(
+            expected_names = residue.format_names_with_synonyms(
                 res_name, defined_canonical_names
             )
             message.append(
