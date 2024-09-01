@@ -1,4 +1,5 @@
 import dataclasses
+import gzip
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -14,7 +15,6 @@ from typing import (
     Iterator,
     Literal,
     Self,
-    TextIO,
     TypeVar,
 )
 from urllib.request import urlopen
@@ -192,9 +192,9 @@ class PDBMolecule:
                 invalidate_cache=False,
             )
 
-        molecule._conformers = [np.asarray(conformer) * unit.angstrom]
         molecule._invalidate_cached_properties()
 
+        molecule.add_conformer(np.asarray(conformer) * unit.angstrom)
         return molecule
 
     def to_networkx(self) -> Graph:
@@ -208,15 +208,12 @@ class PDBMolecule:
         Combine molecules by unifying leaving atoms with the opposite molecule
 
         Preserves leaving annotations in ``other`` but not in ``self``.
-
-        This function does not copy information out of other; semantically, it
-        takes ownership of both arguments.
         """
         # If this is empty, short circuit
         if self.is_empty():
-            self.atoms = other.atoms
-            self.bonds = other.bonds
-            self.properties = other.properties
+            self.atoms = deepcopy(other.atoms)
+            self.bonds = deepcopy(other.bonds)
+            self.properties = deepcopy(other.properties)
             return
 
         # Identify the bond linking the two molecules
@@ -268,7 +265,7 @@ class PDBMolecule:
                 continue
 
             other_to_combined[i] = len(self.atoms)
-            self.add_atom(atom)
+            self.add_atom(deepcopy(atom))
 
         # Add bonds
         n_bonds_removed = 0
@@ -346,6 +343,12 @@ def flatten(container: Iterable[Iterable[T]]) -> Iterable[T]:
         yield from inner
 
 
+def float_or_unknown(s: str) -> float | None:
+    if s == "?":
+        return None
+    return float(s)
+
+
 @dataclass
 class AtomDefinition:
     """
@@ -356,9 +359,9 @@ class AtomDefinition:
     synonyms: list[str]
     symbol: str
     leaving: bool
-    x: float
-    y: float
-    z: float
+    x: float | None
+    y: float | None
+    z: float | None
     charge: int
     aromatic: bool
     stereo: Literal["S", "R"] | None
@@ -398,7 +401,11 @@ class ResidueDefinition:
             PdbxReader(file).read(data)
         block = data[0]
 
-        residueName = block.getObj("chem_comp").getValue("id").upper()
+        residueName = (
+            block.getObj("chem_comp").getValue("mon_nstd_parent_comp_id").upper()
+        )
+        if residueName == "?":
+            residueName = block.getObj("chem_comp").getValue("id").upper()
         residue_description = block.getObj("chem_comp").getValue("name")
         linking_type = block.getObj("chem_comp").getValue("type").upper()
 
@@ -433,9 +440,9 @@ class ResidueDefinition:
                 ),
                 symbol=row[symbolCol][0:1].upper() + row[symbolCol][1:].lower(),
                 leaving=row[leavingCol] == "Y",
-                x=float(row[xCol]),
-                y=float(row[yCol]),
-                z=float(row[zCol]),
+                x=float_or_unknown(row[xCol]),
+                y=float_or_unknown(row[yCol]),
+                z=float_or_unknown(row[zCol]),
                 charge=int(row[chargeCol]),
                 aromatic=row[aromaticCol] == "Y",
                 stereo=None if row[stereoCol] == "N" else row[stereoCol],
@@ -578,13 +585,15 @@ class ResidueDefinition:
                         }"
                     )
                 if synonym in canonical_names:
-                    raise ValueError(f"synonym {
+                    raise ValueError(
+                        f"synonym {
                         synonym
                     } of atom {
                         atom.name
                     } clashes with another canonical name in residue {
                         self.residueName
-                    }")
+                    }"
+                    )
                 mapping[synonym] = atom.name
         return mapping
 
@@ -644,22 +653,6 @@ def dec_hex(s: str) -> int:
         return parsed_as_hex - smallest_hex + largest_dec + 1
 
 
-def pdb_charge(s) -> int:
-    stripped = s.strip()
-    if len(stripped) == 0:
-        return 0
-    elif stripped == "+":
-        return 1
-    elif stripped == "-":
-        return -1
-    elif stripped[-1] == "+":
-        return int(s[:-1])
-    elif stripped[-1] == "-":
-        return -int(s[:-1])
-    else:
-        return int(s)
-
-
 @dataclass
 class PdbData:
     model: list[int | None] = field(default_factory=list)
@@ -707,7 +700,7 @@ class PdbData:
         self.occupancy[-1] = float(line[54:60])
         self.temp_factor[-1] = float(line[60:66])
         self.element[-1] = line[76:78].strip()
-        self.charge[-1] = pdb_charge(line[78:80])
+        self.charge[-1] = int(line[78:80].strip() or 0)
         self.terminated[-1] = False
         self.conects[-1] = set()
 
@@ -811,6 +804,8 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         self.definitions = {}
         self.patches = dict(patches)
 
+        self._load_protonation_variants()
+
         for file in path.glob("*.cif"):
             self._add_definition_from_str(file.read_text())
 
@@ -838,6 +833,15 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
 
         return self._add_definition_from_str(s, res_name=res_name)
 
+    def _apply_patches(self, definition: ResidueDefinition) -> list[ResidueDefinition]:
+        patch_res = self.patches.get(definition.residueName.upper(), lambda x: [x])
+        patch_all = self.patches.get("*", lambda x: [x])
+        patched_definitions = list(patch_all(definition))
+        patched_definitions = list(
+            flatten(patch_res(res) for res in patched_definitions)
+        )
+        return patched_definitions
+
     def _add_definition_from_str(
         self, s: str, res_name: str | None = None
     ) -> list[ResidueDefinition]:
@@ -845,20 +849,32 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         if res_name is None:
             res_name = definition.residueName.upper()
 
-        patch_res = self.patches.get(definition.residueName.upper(), lambda x: [x])
-        patch_all = self.patches.get("*", lambda x: [x])
-        patched_definitions = list(patch_all(definition))
-        patched_definitions = list(
-            flatten(patch_res(res) for res in patched_definitions)
-        )
+        patched_definitions = self._apply_patches(definition)
 
         assert all(
             res_name == definition.residueName.upper()
             for definition in patched_definitions
         )
 
-        self.definitions[res_name] = patched_definitions
+        self.definitions.setdefault(res_name, []).extend(patched_definitions)
         return patched_definitions
+
+    def _load_protonation_variants(self):
+        path = self.path / "aa-variants-v1.cif.gz"
+        if not path.exists():
+            with urlopen(
+                "https://files.wwpdb.org/pub/pdb/data/monomers/aa-variants-v1.cif.gz",
+            ) as stream:
+                b = stream.read()
+            path.write_bytes(b)
+
+        with gzip.open(path) as f:
+            s = f.read().decode("utf-8")
+
+        assert s.startswith("data_")
+        for block in s[5:].split("\ndata_"):
+            block = "data_" + block
+            self._add_definition_from_str("data_" + block)
 
     def _download_cif(self, resname: str) -> str:
         with urlopen(
@@ -903,87 +919,77 @@ def fix_caps(res: ResidueDefinition) -> list[ResidueDefinition]:
     return [res]
 
 
-PROTONATION_VARIANTS = {
-    "HIS": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]([H:20])[C:9]([H:19])=[N:7]1)([H:15])[H:16])[H:14])([H:12])[H:13]",
-        "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N:7]1[H:17])([H:15])[H:16])[H:14])([H:12])[H:13]",
-        "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N-:7]1)([H:15])[H:16])[H:14])([H:12])[H:13]",
-    ],
-    "GLU": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:10][H:19])([C:5]([C:6]([C:7](=[O:8])[O-:9])([H:16])[H:17])([H:14])[H:15])[H:13])([H:11])[H:12]",
-    ],
-    "ASP": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:9][H:16])([C:5]([C:6](=[O:7])[O-:8])([H:13])[H:14])[H:12])([H:10])[H:11]"
-    ],
-    "LYS": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:10][H:25])([C:5]([C:6]([C:7]([C:8]([N:9]([H:22])([H:23]))([H:20])[H:21])([H:18])[H:19])([H:16])[H:17])([H:14])[H:15])[H:13])([H:11])[H:12]"
-    ],
-    "ARG": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:12][H:27])([C:5]([C:6]([C:7]([N:8]([C:9]([N:10]([H:23])[H:24])=[N:11][H:25])[H:22])([H:20])[H:21])([H:18])[H:19])([H:16])[H:17])[H:15])([H:13])[H:14]"
-    ],
-    "CYS": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:7][H:14])([C:5]([S-:6])([H:11])[H:12])[H:10])([H:8])[H:9]"
-    ],
-    "TYR": [
-        "[N:1]([C@:2]([C:3](=[O:4])[O:13][H:24])([C:5]([c:6]1[c:7]([H:19])[c:9]([H:21])[c:11]([O-:12])[c:10]([H:22])[c:8]1[H:20])([H:17])[H:18])[H:16])([H:14])[H:15]"
-    ],
-}
+# PROTONATION_VARIANTS = {
+#     "HIS": [
+#         "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]([H:20])[C:9]([H:19])=[N:7]1)([H:15])[H:16])[H:14])([H:12])[H:13]",
+#         "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N:7]1[H:17])([H:15])[H:16])[H:14])([H:12])[H:13]",
+#         "[N:1]([C@:2]([C:3](=[O:4])[O:11][H:21])([C:5]([C:6]1=[C:8]([H:18])[N:10]=[C:9]([H:19])[N-:7]1)([H:15])[H:16])[H:14])([H:12])[H:13]",
+#     ],
+#     "GLU": [
+#         "[N:1]([C@:2]([C:3](=[O:4])[O:10][H:19])([C:5]([C:6]([C:7](=[O:8])[O-:9])([H:16])[H:17])([H:14])[H:15])[H:13])([H:11])[H:12]",
+#     ],
+#     "ASP": [
+#         "[N:1]([C@:2]([C:3](=[O:4])[O:9][H:16])([C:5]([C:6](=[O:7])[O-:8])([H:13])[H:14])[H:12])([H:10])[H:11]"
+#     ],
+#     "LYS": [
+#         "[N:1]([C@:2]([C:3](=[O:4])[O:10][H:25])([C:5]([C:6]([C:7]([C:8]([N:9]([H:22])([H:23]))([H:20])[H:21])([H:18])[H:19])([H:16])[H:17])([H:14])[H:15])[H:13])([H:11])[H:12]"
+#     ],
+#     "ARG": [
+#         "[N:1]([C@:2]([C:3](=[O:4])[O:12][H:27])([C:5]([C:6]([C:7]([N:8]([C:9]([N:10]([H:23])[H:24])=[N:11][H:25])[H:22])([H:20])[H:21])([H:18])[H:19])([H:16])[H:17])[H:15])([H:13])[H:14]"
+#     ],
+#     "CYS": [
+#         "[N:1]([C@:2]([C:3](=[O:4])[O:7][H:14])([C:5]([S-:6])([H:11])[H:12])[H:10])([H:8])[H:9]"
+#     ],
+#     "TYR": [
+#         "[N:1]([C@:2]([C:3](=[O:4])[O:13][H:24])([C:5]([c:6]1[c:7]([H:19])[c:9]([H:21])[c:11]([O-:12])[c:10]([H:22])[c:8]1[H:20])([H:17])[H:18])[H:16])([H:14])[H:15]"
+#     ],
+# }
 
 
-def add_protonation_variants(res: ResidueDefinition) -> list[ResidueDefinition]:
-    residue_definitions = [res]
+# def add_protonation_variants(res: ResidueDefinition) -> list[ResidueDefinition]:
+#     residue_definitions = [res]
 
-    for variant_smiles in PROTONATION_VARIANTS[res.residueName]:
-        variant = Molecule.from_smiles(variant_smiles, allow_undefined_stereo=True)
-        mappings = variant.properties["atom_map"]
-        atoms = []
-        for i, variant_atom in enumerate(variant.atoms):
-            # TODO: Handle case where extra atom is added in variant
-            db_atom = res.atoms[mappings[i] - 1]
-            new_atom = AtomDefinition(
-                name=db_atom.name,
-                synonyms=db_atom.synonyms,
-                symbol=variant_atom.symbol,
-                leaving=db_atom.leaving,
-                x=db_atom.x,
-                y=db_atom.y,
-                z=db_atom.z,
-                charge=variant_atom.formal_charge,
-                aromatic=variant_atom.is_aromatic,
-                stereo=variant_atom.stereochemistry,
-            )
-            atoms.append(new_atom)
-        bonds = []
-        for variant_bond in variant.bonds:
-            new_bond = BondDefinition(
-                atom1=atoms[variant_bond.atom1_index].name,
-                atom2=atoms[variant_bond.atom2_index].name,
-                order={1: "SING", 2: "DOUB", 3: "TRIP"}[variant_bond.bond_order],
-                aromatic=variant_bond.is_aromatic,
-                stereo=variant_bond.stereochemistry,
-            )
-            bonds.append(new_bond)
+#     for variant_smiles in PROTONATION_VARIANTS[res.residueName]:
+#         variant = Molecule.from_smiles(variant_smiles, allow_undefined_stereo=True)
+#         mappings = variant.properties["atom_map"]
+#         atoms = []
+#         for i, variant_atom in enumerate(variant.atoms):
+#             # TODO: Handle case where extra atom is added in variant
+#             db_atom = res.atoms[mappings[i] - 1]
+#             new_atom = AtomDefinition(
+#                 name=db_atom.name,
+#                 synonyms=db_atom.synonyms,
+#                 symbol=variant_atom.symbol,
+#                 leaving=db_atom.leaving,
+#                 x=db_atom.x,
+#                 y=db_atom.y,
+#                 z=db_atom.z,
+#                 charge=variant_atom.formal_charge,
+#                 aromatic=variant_atom.is_aromatic,
+#                 stereo=variant_atom.stereochemistry,
+#             )
+#             atoms.append(new_atom)
+#         bonds = []
+#         for variant_bond in variant.bonds:
+#             new_bond = BondDefinition(
+#                 atom1=atoms[variant_bond.atom1_index].name,
+#                 atom2=atoms[variant_bond.atom2_index].name,
+#                 order={1: "SING", 2: "DOUB", 3: "TRIP"}[variant_bond.bond_order],
+#                 aromatic=variant_bond.is_aromatic,
+#                 stereo=variant_bond.stereochemistry,
+#             )
+#             bonds.append(new_bond)
+#         residue_definitions.append(
+#             ResidueDefinition(
+#                 residueName=res.residueName,
+#                 smiles=[variant_smiles],
+#                 linking_type=res.linking_type,
+#                 atoms=atoms,
+#                 bonds=bonds,
+#             )
+#         )
 
-        removed_atoms = {atom.name for atom in res.atoms} - {
-            atom.name for atom in variant.atoms
-        }
-        mult = {1: "singly", 2: "doubly", 3: "triply"}.get(
-            len(removed_atoms), f"{len(removed_atoms)}x"
-        )
-        deprotonated_desc = f"{mult}x deprotonated at {", ".join(removed_atoms)}"
-
-        residue_definitions.append(
-            ResidueDefinition(
-                residueName=res.residueName,
-                description=f"{res.description} - {deprotonated_desc}",
-                smiles=[variant_smiles],
-                linking_type=res.linking_type,
-                atoms=atoms,
-                bonds=bonds,
-            )
-        )
-
-    return residue_definitions
+#     return residue_definitions
 
 
 ATOM_NAME_SYNONYMS = {
@@ -1064,7 +1070,7 @@ CCD_RESIDUE_DEFINITION_CACHE = CcdCache(
             "ACE": fix_caps,
             "NME": fix_caps,
         },
-        {key: add_protonation_variants for key in PROTONATION_VARIANTS},
+        # {key: add_protonation_variants for key in PROTONATION_VARIANTS},
         {key: add_synonyms for key in ATOM_NAME_SYNONYMS},
     ),
 )
@@ -1203,26 +1209,6 @@ def _load_residue_from_database(
     res_atom_idcs: list[int],
     residue_database: Mapping[str, list[ResidueDefinition]],
 ) -> PDBMolecule:
-    # TODO: Rewrite
-    #   - Perform first pass over all residues to define chain terminations and
-    #     linking types (and CONECTs and disulfides?)
-    #   - Require all residue definitions of the same name to have the same
-    #     linking type
-    #       - This means the first pass can uniquely identify linking types for
-    #         all residues
-    #       - Can be relaxed in the future with some sort of fork-merge process
-    #   - Define a function from the residue name, all the atom names, and the
-    #     preceding and following linking types to a single residue definition
-    #       - Use linking types to determine desired leaving atoms
-    #       - Otherwise look for an exact match
-    #       - If there's no exact match, fail if replace_missing_atoms=False,
-    #         otherwise... choose the best match? Use a maximalist default?
-    #         One of the above while adding the fewest heavy atoms?
-    #       - Probably implemented as a map from an ordered collection of atom
-    #         names and linking types to a residue definition. Map is defined
-    #         once for each residue name when the CcdCache is generated.
-    #   - Call the above function on each set of its args in second pass over
-    #     residues
     prototype_index = res_atom_idcs[0]
 
     res_name = data.res_name[prototype_index]
@@ -1240,6 +1226,7 @@ def _load_residue_from_database(
     unmatched_atoms = []
     for residue_definition in residue_database[res_name]:
         residue = residue_definition.to_pdb_molecule()
+        print(f"Assessing {residue_definition.description} {residue.to_smiles()}")
         canonical_name_to_index = {
             residue_definition.get_canonical_name(data.name[i]): i
             for i in res_atom_idcs
@@ -1256,6 +1243,7 @@ def _load_residue_from_database(
         if len(unmatched_atoms[-1]) > 0:
             # This residue definition doesn't cover all the atoms in the PDB file
             # So skip it and try the next one
+            print(f"{unmatched_atoms[-1]=}")
             continue
 
         for atom in residue.atoms:
@@ -1269,6 +1257,7 @@ def _load_residue_from_database(
                     "used_synonym": data.name[pdb_index],
                     "canonical_name": atom.name,
                     "atom_serial": data.serial[pdb_index],
+                    "matched_residue_description": residue_definition.description,
                 }
             else:
                 atom_specific_metadata = {}
@@ -1287,20 +1276,46 @@ def _load_residue_from_database(
         )
 
     # Choose the residue with the most atoms found in the PDB
-    def key(residue: PDBMolecule) -> tuple[int, int]:
+    def key(residue: PDBMolecule) -> tuple[int, int, int]:
         coverage = 0
         leavers = 0
         for atom in residue.atoms:
             coverage += "pdb_index" in atom.metadata
             leavers += int(atom.metadata.get("leaving", False))
         excess_atoms = residue.n_atoms - coverage - leavers
-        return (-coverage, excess_atoms)
+        return (-coverage, excess_atoms, -leavers)
 
     sorted_residues = sorted(
         residues,
         key=key,
     )
+
+    for residue in sorted_residues:
+        print(
+            [
+                atom.metadata["res_seq"]
+                for atom in residue.atoms
+                if "res_seq" in atom.metadata
+            ][0],
+            residue.to_openff_molecule().to_smiles(),
+            [
+                atom.metadata["matched_residue_description"]
+                for atom in residue.atoms
+                if "matched_residue_description" in atom.metadata
+            ][0],
+            key(residue),
+        )
+
     residue = sorted_residues[0]
+
+    print(
+        "chose",
+        [
+            atom.metadata["matched_residue_description"]
+            for atom in residue.atoms
+            if "matched_residue_description" in atom.metadata
+        ][0],
+    )
 
     residue.sort_atoms_by_metadata("pdb_index")
 
@@ -1325,7 +1340,7 @@ def cryst_to_box_vectors(
 
 
 def topology_from_pdb(
-    file: str | bytes | PathLike | TextIO,
+    path: PathLike,
     replace_missing_atoms: bool = False,
     use_canonical_names: bool = False,
     unknown_molecules: list[Molecule] = [],
@@ -1333,11 +1348,8 @@ def topology_from_pdb(
         str, list[ResidueDefinition]
     ] = CCD_RESIDUE_DEFINITION_CACHE,
 ) -> Topology:
-    try:
-        lines = Path(file).read_text().splitlines()
-    except TypeError:
-        lines = file.readlines()
-    data = PdbData.parse_pdb(lines)
+    path = Path(path)
+    data = PdbData.parse_pdb(path.read_text().splitlines())
 
     molecules: list[PDBMolecule] = []
     current_molecule = PDBMolecule()
@@ -1366,9 +1378,8 @@ def topology_from_pdb(
         ):
             molecules.append(current_molecule)
             current_molecule = PDBMolecule()
+        # TODO: Ensure atoms are never re-ordered
         current_molecule.combine_with(residue)
-        # semantically, combine_with is a move, so ensure we don't use residue again
-        del residue
 
         if (
             data.terminated[prototype_index]
