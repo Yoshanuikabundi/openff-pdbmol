@@ -2,7 +2,7 @@ import dataclasses
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from functools import cached_property, lru_cache
+from functools import cached_property
 from io import StringIO
 from os import PathLike
 from pathlib import Path
@@ -122,8 +122,10 @@ class PDBMolecule:
                     candidates.update(bond_network[candidate] - leavers)
             if leavers:
                 return (partner, partner_atom, leavers)
+
+        meta = self.atoms[0].metadata
         raise ValueError(
-            f"No partners found: expected {
+            f"No partners found in {meta["residue_name"]}#{meta["res_seq"]}: expected {
                 linked_atomname
             }, found {[
                 (atom.name, atom.metadata.get("atom_serial", ""))
@@ -196,6 +198,9 @@ class PDBMolecule:
 
     def to_networkx(self) -> Graph:
         return self.to_openff_molecule().to_networkx()
+
+    def to_smiles(self) -> str:
+        return self.to_openff_molecule().to_smiles()
 
     def combine_with(self, other: "PDBMolecule"):
         """
@@ -375,6 +380,7 @@ class ResidueDefinition:
     """
 
     residueName: str
+    description: str
     smiles: list[str]
     linking_type: str
     atoms: list[AtomDefinition]
@@ -389,6 +395,7 @@ class ResidueDefinition:
         block = data[0]
 
         residueName = block.getObj("chem_comp").getValue("id").upper()
+        residue_description = block.getObj("chem_comp").getValue("name")
         linking_type = block.getObj("chem_comp").getValue("type").upper()
 
         descriptorsData = block.getObj("pdbx_chem_comp_descriptor")
@@ -415,9 +422,11 @@ class ResidueDefinition:
         atoms = [
             AtomDefinition(
                 name=row[atomNameCol],
-                synonyms=[row[altAtomNameCol]]
-                if row[altAtomNameCol] != row[atomNameCol]
-                else [],
+                synonyms=(
+                    [row[altAtomNameCol]]
+                    if row[altAtomNameCol] != row[atomNameCol]
+                    else []
+                ),
                 symbol=row[symbolCol][0:1].upper() + row[symbolCol][1:].lower(),
                 leaving=row[leavingCol] == "Y",
                 x=float(row[xCol]),
@@ -453,6 +462,7 @@ class ResidueDefinition:
         ret = cls(
             residueName=residueName,
             smiles=smiles,
+            description=residue_description,
             linking_type=linking_type,
             atoms=atoms,
             bonds=bonds,
@@ -1029,7 +1039,11 @@ CCD_RESIDUE_DEFINITION_CACHE = CcdCache(
     ),
 )
 
+
 # TODO: Fill in this data
+PEPTIDE_BOND = BondDefinition(
+    atom1="C", atom2="N", order="SING", aromatic=False, stereo=None
+)
 LINKING_TYPES: dict[str, BondDefinition | None] = {
     # "D-beta-peptide, C-gamma linking".upper(): [],
     # "D-gamma-peptide, C-delta linking".upper(): [],
@@ -1048,9 +1062,7 @@ LINKING_TYPES: dict[str, BondDefinition | None] = {
     # "L-gamma-peptide, C-delta linking".upper(): [],
     # "L-peptide COOH carboxy terminus".upper(): [],
     # "L-peptide NH3 amino terminus".upper(): [],
-    "L-peptide linking".upper(): BondDefinition(
-        atom1="C", atom2="N", order="SING", aromatic=False, stereo=None
-    ),
+    "L-peptide linking".upper(): PEPTIDE_BOND,
     # "L-saccharide".upper(): [],
     # "L-saccharide, alpha linking".upper(): [],
     # "L-saccharide, beta linking".upper(): [],
@@ -1059,10 +1071,8 @@ LINKING_TYPES: dict[str, BondDefinition | None] = {
     # "RNA linking".upper(): [],
     "non-polymer".upper(): None,
     # "other".upper(): [],
-    "peptide linking".upper(): BondDefinition(
-        atom1="C", atom2="N", order="SING", aromatic=False, stereo=None
-    ),
-    # "peptide-like".upper(): [],
+    "peptide linking".upper(): PEPTIDE_BOND,
+    "peptide-like".upper(): PEPTIDE_BOND,
     # "saccharide".upper(): [],
 }
 
@@ -1227,12 +1237,12 @@ def _load_residue_from_database(
         )
 
     # Choose the residue with the most atoms found in the PDB
-    def key(residue: PDBMolecule) -> tuple[int, int]:
+    def key(residue: PDBMolecule) -> tuple[int, int, int]:
         coverage = 0
         leavers = 0
         for atom in residue.atoms:
             coverage += "pdb_index" in atom.metadata
-            leavers += atom.metadata.get("leavers", False)
+            leavers += int(atom.metadata.get("leaving", False))
         excess_atoms = residue.n_atoms - coverage - leavers
         return (-coverage, excess_atoms)
 
