@@ -1,11 +1,13 @@
 name: pdbscan-test
 channels:
   - conda-forge
-  - defaults
 dependencies:
   # Base depends
   - pip
   - python>=3.10
+
+  # Runtime
+  - typer>=0.14
 
   # Examples
   - jupyterlab>=4
@@ -41,7 +43,5 @@ dependencies:
   - pandas
   - numpy
 
-
   #- pip:
   #  - codecov
-
