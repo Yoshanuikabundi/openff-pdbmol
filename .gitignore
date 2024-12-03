@@ -1,3 +1,7 @@
+# Large data
+fixed_pdbs/*.pdb.gz
+*.parquet
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
