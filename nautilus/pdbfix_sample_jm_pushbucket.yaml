@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pdbscan-jm-pushbucket
+spec:
+  containers:
+    - name: pdbscan-jm-rclone
+      image: rclone/rclone
+      resources:
+        limits:
+          memory: 100Mi
+          cpu: 100m
+        requests:
+          memory: 100Mi
+          cpu: 100m
+      command:
+        [
+          "rclone",
+          "--config=/secrets/rclone.conf",
+          "--progress",
+          "copy",
+          "/opt/fixed_pdbs",
+          "nrp-internal:fixed-pdbs-bucket/files",
+        ]
+      volumeMounts:
+        - mountPath: /opt/fixed_pdbs
+          name: fixed-pdbs
+        - name: rclone-config
+          mountPath: /secrets/rclone.conf
+          subPath: rclone.conf
+  volumes:
+    - name: fixed-pdbs
+      persistentVolumeClaim:
+        claimName: pdbscan-jm-workerpvc
+    - name: rclone-config
+      secret:
+        secretName: jm-rclone-config

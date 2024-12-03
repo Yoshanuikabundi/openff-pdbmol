@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdbscan-jm-redis
+  labels:
+    k8s-app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: redis
+  template:
+    metadata:
+      labels:
+        k8s-app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            limits:
+              memory: 100Mi
+              cpu: "1"
+            requests:
+              memory: 10Mi
+              cpu: "10m"
+          command:
+            - redis-server
+            - --save
+            - "60"
+            - "1"
+            - --loglevel
+            - warning
+          volumeMounts:
+            - mountPath: /data
+              name: redisvol
+              readOnly: false
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 5
+            timeoutSeconds: 1
+      volumes:
+        - name: redisvol
+          persistentVolumeClaim:
+            claimName: pdbscan-jm-redisvol
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pdbscan-jm-redis
+spec:
+  ports:
+    - port: 6379
+      targetPort: 6379
+  selector:
+    k8s-app: redis

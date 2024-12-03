@@ -1,0 +1,82 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pdbscan-jm-worker
+spec:
+  parallelism: 19
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: feature.node.kubernetes.io/pci-10de.present
+                    operator: NotIn
+                    values:
+                      - "true"
+      priorityClassName: opportunistic
+      restartPolicy: OnFailure
+      initContainers:
+        - name: pdbscan-jm-init-git
+          image: alpine/git
+          resources:
+            limits:
+              memory: "100Mi"
+              cpu: "100m"
+            requests:
+              memory: "100Mi"
+              cpu: "100m"
+          env:
+          command:
+            - "/bin/sh"
+            - "-c"
+            - "cd /opt/repo && git clone https://gitlab.nrp-nautilus.io/josh.mitchell/pdb-census.git"
+          volumeMounts:
+            - mountPath: /opt/repo
+              name: pdbscan-jm-repo
+        - name: pdbscan-jm-set-pvc-perms
+          image: alpine/git
+          resources:
+            limits:
+              memory: "100Mi"
+              cpu: "100m"
+            requests:
+              memory: "100Mi"
+              cpu: "100m"
+          env:
+          command:
+            - "chmod"
+            - "777"
+            - "/opt/fixed_pdbs"
+          volumeMounts:
+            - mountPath: /opt/fixed_pdbs
+              name: fixed-pdbs
+      containers:
+        - name: pdbscan-jm-worker
+          image: gitlab-registry.nrp-nautilus.io/josh.mitchell/pdb-census:latest
+          resources:
+            limits:
+              memory: "5Gi"
+              cpu: "1"
+            requests:
+              memory: "5Gi"
+              cpu: "1"
+          command:
+            - micromamba
+            - run
+            - -n
+            - base
+            - python
+            - "/opt/repo/pdb-census/pdbfix/worker.py"
+          volumeMounts:
+            - mountPath: /opt/repo
+              name: pdbscan-jm-repo
+            - mountPath: /opt/fixed_pdbs
+              name: fixed-pdbs
+      volumes:
+        - name: pdbscan-jm-repo
+          emptyDir: {}
+        - name: fixed-pdbs
+          persistentVolumeClaim:
+            claimName: pdbscan-jm-workerpvc
