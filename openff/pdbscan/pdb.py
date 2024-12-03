@@ -14,6 +14,7 @@ from typing import (
     Iterator,
     Literal,
     Self,
+    TextIO,
     TypeVar,
 )
 from urllib.request import urlopen
@@ -191,9 +192,9 @@ class PDBMolecule:
                 invalidate_cache=False,
             )
 
+        molecule._conformers = [np.asarray(conformer) * unit.angstrom]
         molecule._invalidate_cached_properties()
 
-        molecule.add_conformer(np.asarray(conformer) * unit.angstrom)
         return molecule
 
     def to_networkx(self) -> Graph:
@@ -207,12 +208,15 @@ class PDBMolecule:
         Combine molecules by unifying leaving atoms with the opposite molecule
 
         Preserves leaving annotations in ``other`` but not in ``self``.
+
+        This function does not copy information out of other; semantically, it
+        takes ownership of both arguments.
         """
         # If this is empty, short circuit
         if self.is_empty():
-            self.atoms = deepcopy(other.atoms)
-            self.bonds = deepcopy(other.bonds)
-            self.properties = deepcopy(other.properties)
+            self.atoms = other.atoms
+            self.bonds = other.bonds
+            self.properties = other.properties
             return
 
         # Identify the bond linking the two molecules
@@ -264,7 +268,7 @@ class PDBMolecule:
                 continue
 
             other_to_combined[i] = len(self.atoms)
-            self.add_atom(deepcopy(atom))
+            self.add_atom(atom)
 
         # Add bonds
         n_bonds_removed = 0
@@ -640,6 +644,22 @@ def dec_hex(s: str) -> int:
         return parsed_as_hex - smallest_hex + largest_dec + 1
 
 
+def pdb_charge(s) -> int:
+    stripped = s.strip()
+    if len(stripped) == 0:
+        return 0
+    elif stripped == "+":
+        return 1
+    elif stripped == "-":
+        return -1
+    elif stripped[-1] == "+":
+        return int(s[:-1])
+    elif stripped[-1] == "-":
+        return -int(s[:-1])
+    else:
+        return int(s)
+
+
 @dataclass
 class PdbData:
     model: list[int | None] = field(default_factory=list)
@@ -687,7 +707,7 @@ class PdbData:
         self.occupancy[-1] = float(line[54:60])
         self.temp_factor[-1] = float(line[60:66])
         self.element[-1] = line[76:78].strip()
-        self.charge[-1] = int(line[78:80].strip() or 0)
+        self.charge[-1] = pdb_charge(line[78:80])
         self.terminated[-1] = False
         self.conects[-1] = set()
 
@@ -943,9 +963,19 @@ def add_protonation_variants(res: ResidueDefinition) -> list[ResidueDefinition]:
                 stereo=variant_bond.stereochemistry,
             )
             bonds.append(new_bond)
+
+        removed_atoms = {atom.name for atom in res.atoms} - {
+            atom.name for atom in variant.atoms
+        }
+        mult = {1: "singly", 2: "doubly", 3: "triply"}.get(
+            len(removed_atoms), f"{len(removed_atoms)}x"
+        )
+        deprotonated_desc = f"{mult}x deprotonated at {", ".join(removed_atoms)}"
+
         residue_definitions.append(
             ResidueDefinition(
                 residueName=res.residueName,
+                description=f"{res.description} - {deprotonated_desc}",
                 smiles=[variant_smiles],
                 linking_type=res.linking_type,
                 atoms=atoms,
@@ -1173,6 +1203,26 @@ def _load_residue_from_database(
     res_atom_idcs: list[int],
     residue_database: Mapping[str, list[ResidueDefinition]],
 ) -> PDBMolecule:
+    # TODO: Rewrite
+    #   - Perform first pass over all residues to define chain terminations and
+    #     linking types (and CONECTs and disulfides?)
+    #   - Require all residue definitions of the same name to have the same
+    #     linking type
+    #       - This means the first pass can uniquely identify linking types for
+    #         all residues
+    #       - Can be relaxed in the future with some sort of fork-merge process
+    #   - Define a function from the residue name, all the atom names, and the
+    #     preceding and following linking types to a single residue definition
+    #       - Use linking types to determine desired leaving atoms
+    #       - Otherwise look for an exact match
+    #       - If there's no exact match, fail if replace_missing_atoms=False,
+    #         otherwise... choose the best match? Use a maximalist default?
+    #         One of the above while adding the fewest heavy atoms?
+    #       - Probably implemented as a map from an ordered collection of atom
+    #         names and linking types to a residue definition. Map is defined
+    #         once for each residue name when the CcdCache is generated.
+    #   - Call the above function on each set of its args in second pass over
+    #     residues
     prototype_index = res_atom_idcs[0]
 
     res_name = data.res_name[prototype_index]
@@ -1237,7 +1287,7 @@ def _load_residue_from_database(
         )
 
     # Choose the residue with the most atoms found in the PDB
-    def key(residue: PDBMolecule) -> tuple[int, int, int]:
+    def key(residue: PDBMolecule) -> tuple[int, int]:
         coverage = 0
         leavers = 0
         for atom in residue.atoms:
@@ -1275,7 +1325,7 @@ def cryst_to_box_vectors(
 
 
 def topology_from_pdb(
-    path: PathLike,
+    file: str | bytes | PathLike | TextIO,
     replace_missing_atoms: bool = False,
     use_canonical_names: bool = False,
     unknown_molecules: list[Molecule] = [],
@@ -1283,8 +1333,11 @@ def topology_from_pdb(
         str, list[ResidueDefinition]
     ] = CCD_RESIDUE_DEFINITION_CACHE,
 ) -> Topology:
-    path = Path(path)
-    data = PdbData.parse_pdb(path.read_text().splitlines())
+    try:
+        lines = Path(file).read_text().splitlines()
+    except TypeError:
+        lines = file.readlines()
+    data = PdbData.parse_pdb(lines)
 
     molecules: list[PDBMolecule] = []
     current_molecule = PDBMolecule()
@@ -1313,8 +1366,9 @@ def topology_from_pdb(
         ):
             molecules.append(current_molecule)
             current_molecule = PDBMolecule()
-        # TODO: Ensure atoms are never re-ordered
         current_molecule.combine_with(residue)
+        # semantically, combine_with is a move, so ensure we don't use residue again
+        del residue
 
         if (
             data.terminated[prototype_index]
