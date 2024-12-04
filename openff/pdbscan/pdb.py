@@ -567,7 +567,8 @@ class ResidueDefinition:
         return molecule
 
     @cached_property
-    def _name_to_canonical_name(self) -> dict[str, str]:
+    def name_to_canonical_name(self) -> dict[str, str]:
+        """Map from each atoms' name and synonyms to its name."""
         mapping = {}
         canonical_names = {atom.name for atom in self.atoms}
         for atom in self.atoms:
@@ -596,9 +597,6 @@ class ResidueDefinition:
                     )
                 mapping[synonym] = atom.name
         return mapping
-
-    def get_canonical_name(self, name: str) -> str:
-        return self._name_to_canonical_name.get(name, name)
 
     def format_names_with_synonyms(self, res_name: str, atom_names: set[str]) -> str:
         atoms = []
@@ -796,55 +794,57 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         self,
         path: Path,
         preload: list[str] = [],
-        patches: dict[str, Callable[[ResidueDefinition], list[ResidueDefinition]]] = {},
+        patches: Mapping[
+            str, Callable[[ResidueDefinition], list[ResidueDefinition]]
+        ] = {},
     ):
         self.path = path.resolve()
         self.path.mkdir(parents=True, exist_ok=True)
 
-        self.definitions = {}
-        self.patches = dict(patches)
+        self._definitions: dict[str, list[ResidueDefinition]] = {}
+        self._patches: dict[
+            str, Callable[[ResidueDefinition], list[ResidueDefinition]]
+        ] = dict(patches)
 
         self._load_protonation_variants()
 
         for file in path.glob("*.cif"):
             self._add_definition_from_str(file.read_text())
 
-        for resname in set(preload) - set(self.definitions):
-            self.get(resname)
+        for resname in set(preload) - set(self._definitions):
+            self[resname]
 
     def __repr__(self):
         return f"CcdCache(path={
             self.path
         }, preload={
-            list(self.definitions)
+            list(self._definitions)
         }, patches={
-            self.patches!r
+            self._patches!r
         })"
 
     def __getitem__(self, key: str) -> list[ResidueDefinition]:
         res_name = key.upper()
-        if res_name in self.definitions:
-            return self.definitions[res_name]
+        if res_name in ["UNK", "UNL"]:
+            # These residue names are reserved for unknown ligands/peptide residues
+            raise KeyError(res_name)
+        if res_name not in self._definitions:
+            try:
+                s = (self.path / f"{res_name.upper()}.cif").read_text()
+            except Exception:
+                s = self._download_cif(res_name)
 
-        try:
-            s = (self.path / f"{res_name.upper()}.cif").read_text()
-        except Exception:
-            s = self._download_cif(res_name)
-
-        return self._add_definition_from_str(s, res_name=res_name)
+            self._add_definition_from_str(s, res_name=res_name)
+        return self._definitions[res_name]
 
     def _apply_patches(self, definition: ResidueDefinition) -> list[ResidueDefinition]:
-        patch_res = self.patches.get(definition.residueName.upper(), lambda x: [x])
-        patch_all = self.patches.get("*", lambda x: [x])
-        patched_definitions = list(patch_all(definition))
-        patched_definitions = list(
-            flatten(patch_res(res) for res in patched_definitions)
-        )
-        return patched_definitions
+        # Get the patches for this definition, or the identity function if absent
+        patch_res = self._patches.get(definition.residueName.upper(), lambda x: [x])
+        patch_all = self._patches.get("*", lambda x: [x])
+        # Apply the patches and flatten as appropriate
+        return list(flatten(patch_res(res) for res in patch_all(definition)))
 
-    def _add_definition_from_str(
-        self, s: str, res_name: str | None = None
-    ) -> list[ResidueDefinition]:
+    def _add_definition_from_str(self, s: str, res_name: str | None = None) -> None:
         definition = ResidueDefinition.from_ccd_str(s)
         if res_name is None:
             res_name = definition.residueName.upper()
@@ -856,8 +856,7 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
             for definition in patched_definitions
         )
 
-        self.definitions.setdefault(res_name, []).extend(patched_definitions)
-        return patched_definitions
+        self._definitions.setdefault(res_name, []).extend(patched_definitions)
 
     def _load_protonation_variants(self):
         path = self.path / "aa-variants-v1.cif.gz"
@@ -886,25 +885,18 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         return s
 
     def __contains__(self, value) -> bool:
-        if value in ["UNK", "UNL"]:
-            # These residue names are reserved for unknown ligands/peptide residues
-            return False
-
-        if len(value) == 3:
-            # All residue names of three letters are assigned
-            return True
-
         try:
-            self.get(value)
+            self[value]
             return True
         except Exception:
+            # This catches KeyError, but also failures to download the residue
             return False
 
     def __iter__(self) -> Iterator[str]:
-        return self.definitions.__iter__()
+        return self._definitions.__iter__()
 
     def __len__(self) -> int:
-        return self.definitions.__len__()
+        return self._definitions.__len__()
 
 
 def fix_caps(res: ResidueDefinition) -> list[ResidueDefinition]:
@@ -997,6 +989,7 @@ ATOM_NAME_SYNONYMS = {
     "NA": {"NA": ["Na"]},
     "CL": {"CL": ["Cl"]},
 }
+"""Map from residue name and then canonical atom name to a list of synonyms"""
 
 
 def add_synonyms(res: ResidueDefinition) -> list[ResidueDefinition]:
@@ -1215,107 +1208,59 @@ def _load_residue_from_database(
     res_seq = data.res_seq[prototype_index]
     chain_id = data.chain_id[prototype_index]
     i_code = data.i_code[prototype_index]
+
+    for residue_definition in residue_database[res_name]:
+        # Skip definitions with the wrong number of atoms
+        if len(residue_definition.atoms) != len(res_atom_idcs):
+            continue
+
+        # Construct a map from an atom's canonical name in this definition
+        # to its index in the PDB file. This accounts for synonyms defined in
+        # the residue database. If a name is not in the current definition,
+        # no canonical name will be found and the definition can be skipped
+        try:
+            canonical_name_to_index = {
+                residue_definition.name_to_canonical_name[data.name[i]]: i
+                for i in res_atom_idcs
+            }
+        except KeyError:
+            continue
+
+        # We now know that this definition has the right number of atoms and
+        # that each atom name in the PDB file has a match, so we just need
+        # to make sure there are no double matches and then we've found the
+        # right residue definition
+        if len(canonical_name_to_index) != len(res_atom_idcs):
+            continue
+
+        # We've found a matching residue, no need to keep looking
+        # TODO: Consider checking all definitions and raising an error if multiple match
+        break
+    else:
+        raise NoMatchingResidueDefinitionError(res_name, res_seq, chain_id, i_code)
+
+    residue = residue_definition.to_pdb_molecule()
+
     residue_wide_metadata = {
         "residue_number": str(res_seq),
         "res_seq": res_seq,
         "insertion_code": i_code,
         "chain_id": chain_id,
     }
-
-    residues: list[PDBMolecule] = []
-    unmatched_atoms = []
-    for residue_definition in residue_database[res_name]:
-        residue = residue_definition.to_pdb_molecule()
-        print(f"Assessing {residue_definition.description} {residue.to_smiles()}")
-        canonical_name_to_index = {
-            residue_definition.get_canonical_name(data.name[i]): i
-            for i in res_atom_idcs
+    for atom in residue.atoms:
+        pdb_index = canonical_name_to_index[atom.name]
+        atom.x = data.x[pdb_index]
+        atom.y = data.y[pdb_index]
+        atom.z = data.z[pdb_index]
+        atom_specific_metadata = {
+            "pdb_index": pdb_index,
+            "used_synonym": data.name[pdb_index],
+            "canonical_name": atom.name,
+            "atom_serial": data.serial[pdb_index],
+            "matched_residue_description": residue_definition.description,
         }
 
-        res_def_atom_names = {atom.name for atom in residue.atoms}
-
-        unmatched_atoms.append([])
-        for name, index in canonical_name_to_index.items():
-            if name in res_def_atom_names:
-                continue
-            else:
-                unmatched_atoms[-1].append((name, index))
-        if len(unmatched_atoms[-1]) > 0:
-            # This residue definition doesn't cover all the atoms in the PDB file
-            # So skip it and try the next one
-            print(f"{unmatched_atoms[-1]=}")
-            continue
-
-        for atom in residue.atoms:
-            if atom.name in canonical_name_to_index:
-                pdb_index = canonical_name_to_index[atom.name]
-                atom.x = data.x[pdb_index]
-                atom.y = data.y[pdb_index]
-                atom.z = data.z[pdb_index]
-                atom_specific_metadata = {
-                    "pdb_index": pdb_index,
-                    "used_synonym": data.name[pdb_index],
-                    "canonical_name": atom.name,
-                    "atom_serial": data.serial[pdb_index],
-                    "matched_residue_description": residue_definition.description,
-                }
-            else:
-                atom_specific_metadata = {}
-
-            atom.metadata.update(residue_wide_metadata | atom_specific_metadata)
-        residues.append(residue)
-
-    if len(residues) == 0:
-        raise NoMatchingResidueDefinitionError(
-            res_name,
-            res_seq,
-            chain_id,
-            i_code,
-            unmatched_atoms,
-            residue_database[res_name],
-        )
-
-    # Choose the residue with the most atoms found in the PDB
-    def key(residue: PDBMolecule) -> tuple[int, int, int]:
-        coverage = 0
-        leavers = 0
-        for atom in residue.atoms:
-            coverage += "pdb_index" in atom.metadata
-            leavers += int(atom.metadata.get("leaving", False))
-        excess_atoms = residue.n_atoms - coverage - leavers
-        return (-coverage, excess_atoms, -leavers)
-
-    sorted_residues = sorted(
-        residues,
-        key=key,
-    )
-
-    for residue in sorted_residues:
-        print(
-            [
-                atom.metadata["res_seq"]
-                for atom in residue.atoms
-                if "res_seq" in atom.metadata
-            ][0],
-            residue.to_openff_molecule().to_smiles(),
-            [
-                atom.metadata["matched_residue_description"]
-                for atom in residue.atoms
-                if "matched_residue_description" in atom.metadata
-            ][0],
-            key(residue),
-        )
-
-    residue = sorted_residues[0]
-
-    print(
-        "chose",
-        [
-            atom.metadata["matched_residue_description"]
-            for atom in residue.atoms
-            if "matched_residue_description" in atom.metadata
-        ][0],
-    )
+        atom.metadata.update(residue_wide_metadata | atom_specific_metadata)
 
     residue.sort_atoms_by_metadata("pdb_index")
 
@@ -1325,18 +1270,18 @@ def _load_residue_from_database(
 def cryst_to_box_vectors(
     a: float, b: float, c: float, alpha: float, beta: float, gamma: float
 ) -> Quantity:
+    import openmm.unit
     from openmm.app.internal.unitcell import computePeriodicBoxVectors
-    from openmm.unit import angstrom, degrees, nanometer
 
     box_vectors = computePeriodicBoxVectors(
-        a * angstrom,
-        b * angstrom,
-        c * angstrom,
-        alpha * degrees,
-        beta * degrees,
-        gamma * degrees,
+        openmm.unit.Quantity(a, openmm.unit.angstrom),
+        openmm.unit.Quantity(b, openmm.unit.angstrom),
+        openmm.unit.Quantity(c, openmm.unit.angstrom),
+        openmm.unit.Quantity(alpha, openmm.unit.degree),
+        openmm.unit.Quantity(beta, openmm.unit.degree),
+        openmm.unit.Quantity(gamma, openmm.unit.degree),
     )
-    return box_vectors.value_in_unit(nanometer) * unit.nanometer
+    return box_vectors.value_in_unit(openmm.unit.nanometer) * unit.nanometer
 
 
 def topology_from_pdb(
@@ -1355,15 +1300,21 @@ def topology_from_pdb(
     current_molecule = PDBMolecule()
     prev_chain_id = __UNSET__
     prev_model = __UNSET__
+    # Chunk atom indices into residues and iterate over them (see PdbData.residues())
     for res_atom_idcs in data.residues():
         prototype_index = res_atom_idcs[0]
         res_name = data.res_name[prototype_index]
 
+        # If this is the first residue, we'll need to initialize the variables
+        # that refer to the previous residue as though the previous residue
+        # was in the same chain and model (imagine there's an empty zeroth
+        # residue)
         if prev_chain_id is __UNSET__:
             prev_chain_id = data.chain_id[prototype_index]
         if prev_model is __UNSET__:
             prev_model = data.model[prototype_index]
 
+        # Identify this residue and get a PDBMolecule of it
         # TODO: UNK is for unknown peptide residues, but we just treat it as a ligand
         # Note that for the CCD_RESIDUE_DEFINITION_CACHE, "not in" includes a check
         # for the residue names "UNL" and "UNK"
@@ -1372,19 +1323,23 @@ def topology_from_pdb(
         else:
             residue = _load_residue_from_database(data, res_atom_idcs, residue_database)
 
+        # Terminate the previous molecule and start a new one if we can see that
+        # this is the start of a new molecule
         if (
             residue.properties["linking_type"] == "NON-POLYMER"
-            and not current_molecule.is_empty()
+            or data.chain_id[prototype_index] != prev_chain_id
+            or data.model[prototype_index] != prev_model
         ):
             molecules.append(current_molecule)
             current_molecule = PDBMolecule()
+
+        # Add the PDBMolecule matching the current residue to the growing molecule
         # TODO: Ensure atoms are never re-ordered
         current_molecule.combine_with(residue)
 
+        # Terminate the current molecule if we can see that this is the last residue
         if (
             data.terminated[prototype_index]
-            or data.chain_id[prototype_index] != prev_chain_id
-            or data.model[prototype_index] != prev_model
             or current_molecule.properties["linking_type"] == "NON-POLYMER"
         ):
             molecules.append(current_molecule)
@@ -1396,15 +1351,6 @@ def topology_from_pdb(
 
         prev_chain_id = data.chain_id[prototype_index]
         prev_model = data.model[prototype_index]
-
-    if not replace_missing_atoms:
-        missing_atoms = []
-        for molecule in molecules:
-            for i, atom in enumerate(molecule.atoms):
-                if "pdb_index" not in atom.metadata:
-                    missing_atoms.append(atom)
-        if missing_atoms:
-            raise MissingAtomsFromPDBError(missing_atoms)
 
     if not use_canonical_names:
         for molecule in molecules:
@@ -1463,24 +1409,7 @@ class NoMatchingResidueDefinitionError(ValueError):
         res_seq: int,
         chain_id: str,
         i_code: str,
-        unmatched_atoms: list[list[str]],
-        residue_definitions: list[ResidueDefinition],
     ):
-        message = [
-            f"No residue definitions covered all atoms in {res_name}#{res_seq}{i_code.strip()}:{chain_id}",
-            "The following definitions were considered:",
-        ]
-        assert len(unmatched_atoms) == len(residue_definitions)
-        for i, (unmatched_names, residue) in enumerate(
-            zip(unmatched_atoms, residue_definitions)
-        ):
-            defined_canonical_names = {atom.name for atom in residue.atoms}
-            expected_names = residue.format_names_with_synonyms(
-                res_name, defined_canonical_names
-            )
-            message.append(
-                f"    {i}: {unmatched_names} were not among {expected_names}"
-            )
-
-        self.unmatched_atoms = unmatched_atoms
-        super().__init__("\n".join(message))
+        super().__init__(
+            f"No residue definitions covered all atoms in {res_name}#{res_seq}{i_code.strip()}:{chain_id}"
+        )
