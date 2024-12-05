@@ -1,17 +1,28 @@
+import multiprocessing
 from os import PathLike, cpu_count
 from pathlib import Path
-from itertools import batched
 from typing import Callable, Iterable
-import multiprocessing
 
+import mdtraj
+import nglview
+import numpy as np
 import openmm
 import openmm.app
-import mdtraj
-import numpy as np
-from openff.units import ensure_quantity
-import nglview
 import polars as pl
 from polars.type_aliases import SizeUnit
+
+from openff.units import ensure_quantity
+
+
+def batched(iterable, n):
+    "Batch data into lists of length n. The last batch may be shorter."
+    # batched('ABCDEFG', 3) --> ABC DEF G
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, n))
+        if not batch:
+            return
+        yield batch
 
 
 def nglview_show_openmm(

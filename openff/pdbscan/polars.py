@@ -1,7 +1,8 @@
-import polars as pl
+import gzip
 from pathlib import Path
 from typing import Iterable
-import gzip
+
+import polars as pl
 
 __all__ = [
     "load_coords",
@@ -31,6 +32,7 @@ COORD_LINE_SCHEMA = {
     "modelNo": pl.Int32,
     "conects": pl.List(pl.Int32),
 }
+"""Schema for a PDB coordinate line"""
 
 
 def _prepare_row(data: dict[str, list], path: Path):
