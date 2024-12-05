@@ -1,0 +1,261 @@
+"""
+Tools for reading and patching the PDB Chemical Component Dictionary (CCD).
+"""
+
+import gzip
+from copy import deepcopy
+from pathlib import Path
+from typing import Callable, Iterator, Mapping
+from urllib.request import urlopen
+
+from openff.pdbscan.pdb._bond_definition import PEPTIDE_BOND
+
+from ._utils import flatten, unwrap
+from .residue import ResidueDefinition
+
+__all__ = [
+    "CCD_RESIDUE_DEFINITION_CACHE",
+    "CcdCache",
+    "fix_caps",
+    "ATOM_NAME_SYNONYMS",
+    "add_synonyms",
+    "disambiguate_alt_ids",
+    "combine_patches",
+]
+
+
+class CcdCache(Mapping[str, list[ResidueDefinition]]):
+    """
+    Caches, patches, and presents the CCD as a Python ``Mapping``.
+
+    This requires internet access to work.
+
+    Parameters
+    ==========
+    path
+        The path to which to download CCD entries.
+    preload
+        A list of residue names to download when initializing the class.
+    patches
+        Functions to call on the given ``ResidueDefinitions`` before they are
+        returned. A map from residue names to a single callable. The patch
+        corresponding to key ``"*"`` will be applied to all residues before the
+        more specific patches. Use :py:func:`combine_patches` to combine
+        multiple patches into one.
+    """
+
+    # TODO: Methods for adding entries from mapped SMILES
+
+    def __init__(
+        self,
+        path: Path,
+        preload: list[str] = [],
+        patches: Mapping[
+            str, Callable[[ResidueDefinition], list[ResidueDefinition]]
+        ] = {},
+    ):
+        self._path = path.resolve()
+        self._path.mkdir(parents=True, exist_ok=True)
+
+        self._definitions: dict[str, list[ResidueDefinition]] = {}
+        self._patches: dict[
+            str, Callable[[ResidueDefinition], list[ResidueDefinition]]
+        ] = dict(patches)
+
+        self._load_protonation_variants()
+
+        for file in path.glob("*.cif"):
+            self._add_definition_from_str(file.read_text())
+
+        for resname in set(preload) - set(self._definitions):
+            self[resname]
+
+    def __repr__(self):
+        return (
+            f"CcdCache(path={self._path},"
+            + f" preload={list(self._definitions)},"
+            + f" patches={self._patches!r})"
+        )
+
+    def __getitem__(self, key: str) -> list[ResidueDefinition]:
+        res_name = key.upper()
+        if res_name in ["UNK", "UNL"]:
+            # These residue names are reserved for unknown ligands/peptide residues
+            raise KeyError(res_name)
+        if res_name not in self._definitions:
+            try:
+                s = (self._path / f"{res_name.upper()}.cif").read_text()
+            except Exception:
+                s = self._download_cif(res_name)
+
+            self._add_definition_from_str(s, res_name=res_name)
+        return self._definitions[res_name]
+
+    def _apply_patches(self, definition: ResidueDefinition) -> list[ResidueDefinition]:
+        # Get the patches for this definition, or the identity function if absent
+        patch_res = self._patches.get(definition.residue_name.upper(), lambda x: [x])
+        patch_all = self._patches.get("*", lambda x: [x])
+        # Apply the patches and flatten as appropriate
+        return list(flatten(patch_res(res) for res in patch_all(definition)))
+
+    def _add_definition_from_str(self, s: str, res_name: str | None = None) -> None:
+        definition = ResidueDefinition.from_ccd_str(s)
+        if res_name is None:
+            res_name = definition.residue_name.upper()
+
+        patched_definitions = self._apply_patches(definition)
+
+        assert all(
+            res_name == definition.residue_name.upper()
+            for definition in patched_definitions
+        )
+
+        self._definitions.setdefault(res_name, []).extend(patched_definitions)
+
+    def _load_protonation_variants(self):
+        path = self._path / "aa-variants-v1.cif.gz"
+        if not path.exists():
+            with urlopen(
+                "https://files.wwpdb.org/pub/pdb/data/monomers/aa-variants-v1.cif.gz",
+            ) as stream:
+                b = stream.read()
+            path.write_bytes(b)
+
+        with gzip.open(path) as f:
+            s = f.read().decode("utf-8")
+
+        assert s.startswith("data_")
+        for block in s[5:].split("\ndata_"):
+            block = "data_" + block
+            self._add_definition_from_str("data_" + block)
+
+    def _download_cif(self, resname: str) -> str:
+        with urlopen(
+            f"https://files.rcsb.org/ligands/download/{resname.upper()}.cif",
+        ) as stream:
+            s = stream.read().decode("utf-8")
+        path = self._path / f"{resname.upper()}.cif"
+        path.write_text(s)
+        return s
+
+    def __contains__(self, value) -> bool:
+        if value in self._definitions:
+            return True
+
+        try:
+            self[value]
+        except Exception:
+            # This catches KeyError, but also failures to download the residue
+            return False
+        else:
+            return True
+
+    def __iter__(self) -> Iterator[str]:
+        return self._definitions.__iter__()
+
+    def __len__(self) -> int:
+        return self._definitions.__len__()
+
+
+def fix_caps(res: ResidueDefinition) -> list[ResidueDefinition]:
+    """
+    Fix ``"NON-POLYMER"`` residues so they can be used as caps for peptides.
+    """
+    res.linking_bond = PEPTIDE_BOND
+
+    if res.residue_name == "ACE":
+        for atom in res.atoms:
+            if atom.name == "H":
+                atom.leaving = True
+                break
+
+    return [res]
+
+
+ATOM_NAME_SYNONYMS = {
+    "NME": {"HN2": ["H"]},
+    "NA": {"NA": ["Na"]},
+    "CL": {"CL": ["Cl"]},
+}
+"""Map from residue name and then canonical atom name to a list of synonyms"""
+
+
+def add_synonyms(res: ResidueDefinition) -> list[ResidueDefinition]:
+    """
+    Patch a residue definition to include synonyms from :py:data:`ATOM_NAME_SYNONYMS`.
+    """
+    for atom in res.atoms:
+        atom.synonyms.extend(ATOM_NAME_SYNONYMS[res.residue_name].get(atom.name, []))
+    return [res]
+
+
+def disambiguate_alt_ids(res: ResidueDefinition) -> list[ResidueDefinition]:
+    """
+    CCD patch: put alt atom ids in their own residue definitions if needed
+
+    This patch should be run before other patches that add synonyms, as it
+    assumes that there is at most one synonym that came from the CCD alt id
+    flag.
+
+    Some CCD residues (like GLY) have alternative atom IDs that clash with
+    canonical IDs for a different atom. This breaks synonyms because the
+    clashing alternate ID is never assigned; the PDB file is interpreted as
+    having two copies of the canonical ID atom. To fix this, we just split
+    residue definitions with this clashing problem into two definitions, one
+    with the canonical IDs and the other with the alternates.
+    """
+    clashes = []
+    canonical_names = {atom.name for atom in res.atoms}
+    for i, atom in enumerate(res.atoms):
+        for synonym in atom.synonyms:
+            if synonym in canonical_names:
+                clashes.append(i)
+
+    if clashes:
+        res2 = deepcopy(res)
+        old_to_new = {}
+        for atom in res2.atoms:
+            old_to_new[atom.name] = atom.name
+            if atom.synonyms:
+                synonym = unwrap(atom.synonyms)
+                old_to_new[atom.name] = synonym
+                atom.name = synonym
+                atom.synonyms = []
+        for bond in res2.bonds:
+            bond.atom1 = old_to_new[bond.atom1]
+            bond.atom2 = old_to_new[bond.atom2]
+        for clash in clashes:
+            res.atoms[clash].synonyms = []
+        return [res, res2]
+    else:
+        return [res]
+
+
+def combine_patches(
+    *patches: dict[str, Callable[[ResidueDefinition], list[ResidueDefinition]]],
+) -> dict[str, Callable[[ResidueDefinition], list[ResidueDefinition]]]:
+    """Combine multiple ``dict`` objects of patches into a single patchset"""
+    combined = {}
+    for patch in patches:
+        for key, fn in patch.items():
+            if key in combined:
+                existing_fn = combined[key]
+                combined[key] = lambda x: list(flatten(fn(y) for y in existing_fn(x)))
+            else:
+                combined[key] = fn
+    return combined
+
+
+# TODO: Replace these patches with CONECT records?
+CCD_RESIDUE_DEFINITION_CACHE = CcdCache(
+    Path(__file__).parent / "../../.ccd_cache",
+    patches=combine_patches(
+        {"*": disambiguate_alt_ids},
+        {
+            "ACE": fix_caps,
+            "NME": fix_caps,
+        },
+        {key: add_synonyms for key in ATOM_NAME_SYNONYMS},
+    ),
+)
+"""The CCD, with commonly-required patches"""
