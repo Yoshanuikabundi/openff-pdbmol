@@ -170,7 +170,7 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         atoms = [
             AtomDefinition(
                 name=row[atomNameCol],
-                synonyms=(
+                synonyms=set(
                     [row[altAtomNameCol]]
                     if row[altAtomNameCol] != row[atomNameCol]
                     else []
@@ -208,8 +208,8 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
             residue_name=residueName,
             description=residue_description,
             linking_bond=linking_bond,
-            atoms=atoms,
-            bonds=bonds,
+            atoms=tuple(atoms),
+            bonds=tuple(bonds),
         )
 
     def __contains__(self, value) -> bool:
@@ -264,7 +264,7 @@ def add_synonyms(res: ResidueDefinition) -> list[ResidueDefinition]:
     Patch a residue definition to include synonyms from :py:data:`ATOM_NAME_SYNONYMS`.
     """
     for atom in res.atoms:
-        atom.synonyms.extend(ATOM_NAME_SYNONYMS[res.residue_name].get(atom.name, []))
+        atom.synonyms.update(ATOM_NAME_SYNONYMS[res.residue_name].get(atom.name, []))
     return [res]
 
 

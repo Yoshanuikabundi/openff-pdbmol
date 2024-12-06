@@ -4,9 +4,10 @@ Classes for defining custom residues.
 
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, lru_cache
 from typing import (
     Collection,
+    Iterator,
     Literal,
     Mapping,
     Self,
@@ -14,8 +15,6 @@ from typing import (
 
 from openff.toolkit import Molecule
 from openff.units import elements
-
-from ._pdb_molecule import PDBAtom, PDBBond, PDBMolecule
 
 __all__ = [
     "AtomDefinition",
@@ -31,7 +30,7 @@ class AtomDefinition:
     """
 
     name: str
-    synonyms: list[str]
+    synonyms: set[str]
     symbol: str
     leaving: bool
     charge: int
@@ -61,14 +60,16 @@ class ResidueDefinition:
     residue_name: str
     description: str
     linking_bond: BondDefinition | None
-    atoms: list[AtomDefinition]
-    bonds: list[BondDefinition]
+    atoms: tuple[AtomDefinition, ...]
+    bonds: tuple[BondDefinition, ...]
 
     def __post_init__(self):
         if self.linking_bond is None and True in {atom.leaving for atom in self.atoms}:
             raise ValueError(
-                "Leaving atoms were specififed, but there is no linking bond"
+                "Leaving atoms were specified, but there is no linking bond"
             )
+        if len(set(atom.name for atom in self.atoms)) != len(self.atoms):
+            raise ValueError("All atoms must have unique canonical names")
 
     @classmethod
     def from_molecule(
@@ -83,7 +84,7 @@ class ResidueDefinition:
             atoms.append(
                 AtomDefinition(
                     name=atom.name,
-                    synonyms=[],
+                    synonyms=set(),
                     symbol=atom.symbol,
                     leaving=bool(atom.metadata.get("leaving_atom")),
                     charge=atom.formal_charge,
@@ -107,8 +108,8 @@ class ResidueDefinition:
             residue_name=name,
             description=description,
             linking_bond=linking_bond,
-            atoms=atoms,
-            bonds=bonds,
+            atoms=tuple(atoms),
+            bonds=tuple(bonds),
         )
 
     @classmethod
@@ -187,50 +188,14 @@ class ResidueDefinition:
 
         return molecule
 
-    def to_pdb_molecule(self) -> PDBMolecule:
-        molecule = PDBMolecule()
-        atoms: dict[str, int] = {}
-        for atom in self.atoms:
-            new_atom = PDBAtom(
-                atomic_number=elements.NUMBERS[atom.symbol],
-                formal_charge=atom.charge,
-                is_aromatic=atom.aromatic,
-                stereochemistry=atom.stereo,
-                name=atom.name,
-                metadata={
-                    "residue_name": self.residue_name,
-                    "leaving": atom.leaving,
-                },
-            )
-            atoms[atom.name] = len(molecule.atoms)
-            molecule.add_atom(new_atom)
-
-        for bond in self.bonds:
-            new_bond = PDBBond(
-                atom1=atoms[bond.atom1],
-                atom2=atoms[bond.atom2],
-                bond_order=bond.order,
-                is_aromatic=bond.aromatic,
-                stereochemistry=bond.stereo,
-            )
-            molecule.add_bond(new_bond)
-
-        molecule.properties.update(
-            {
-                "linking_bond": self.linking_bond,
-            }
-        )
-
-        return molecule
-
     @cached_property
-    def name_to_canonical_name(self) -> dict[str, str]:
-        """Map from each atoms' name and synonyms to its name."""
-        canonical_names = {atom.name for atom in self.atoms}
-        mapping = {name: name for name in canonical_names}
+    def name_to_atom(self) -> dict[str, AtomDefinition]:
+        """Map from each atoms' name and synonyms to the value of a field."""
+        mapping = {atom.name: atom for atom in self.atoms}
+        canonical_names = set(mapping)
         for atom in self.atoms:
             for synonym in atom.synonyms:
-                if synonym in mapping and mapping[synonym] != atom.name:
+                if synonym in mapping and mapping[synonym] != atom:
                     raise ValueError(
                         f"synonym {synonym} degenerately defined for canonical"
                         + f" names {mapping[synonym]} and {atom.name} in"
@@ -241,5 +206,13 @@ class ResidueDefinition:
                         f"synonym {synonym} of atom {atom.name} clashes with"
                         + f" another canonical name in residue {self.residue_name}"
                     )
-                mapping[synonym] = atom.name
+                mapping[synonym] = atom
         return mapping
+
+    @lru_cache
+    def atoms_bonded_to(self, atom_name: str) -> Iterator[str]:
+        for bond in self.bonds:
+            if bond.atom1 == atom_name:
+                yield bond.atom2
+            if bond.atom2 == atom_name:
+                yield bond.atom1

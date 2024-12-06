@@ -1,9 +1,65 @@
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Self, Sequence
+from functools import cached_property
+from typing import Any, Iterable, Iterator, Mapping, Self, Sequence
 
 from ._utils import __UNSET__, dec_hex
-from .residue import ResidueDefinition
+from .residue import AtomDefinition, ResidueDefinition
+
+
+@dataclass(frozen=True)
+class ResidueMatch:
+    index_to_atomdef: dict[int, AtomDefinition]
+    residue_definition: ResidueDefinition
+    missing_atoms: set[str]
+
+    def atom(self, identifier: int | str) -> AtomDefinition:
+        if isinstance(identifier, int):
+            return self.index_to_atomdef[identifier]
+        elif isinstance(identifier, str):
+            return self.residue_definition.name_to_atom[identifier]
+        else:
+            raise TypeError(f"unknown identifier type {type(identifier)}")
+
+    @cached_property
+    def res_atom_idcs(self) -> set[int]:
+        return set(self.index_to_atomdef)
+
+    @cached_property
+    def missing_leaving_atoms(self) -> set[str]:
+        return {
+            atom_name
+            for atom_name in self.missing_atoms
+            if self.atom(atom_name).leaving
+        }
+
+    @cached_property
+    def expect_prior_bond(self) -> bool:
+        if self.residue_definition.linking_bond is None:
+            return False
+
+        linking_atom = self.residue_definition.linking_bond.atom2
+        print(f"{linking_atom=}")
+        bonded_to_linking_atom = self.residue_definition.atoms_bonded_to(linking_atom)
+        print(f"{linking_atom=}, {bonded_to_linking_atom=}")
+
+        # TODO: Check all leaving atoms for the prior bond
+        return any(
+            atom in self.missing_leaving_atoms for atom in bonded_to_linking_atom
+        )
+
+    @cached_property
+    def expect_posterior_bond(self) -> bool:
+        if self.residue_definition.linking_bond is None:
+            return False
+
+        linking_atom = self.residue_definition.linking_bond.atom1
+
+        # TODO: Check all leaving atoms for the posterior bond
+        return any(
+            atom in self.missing_leaving_atoms
+            for atom in self.residue_definition.atoms_bonded_to(linking_atom)
+        )
 
 
 @dataclass
@@ -147,7 +203,7 @@ class PdbData:
         self,
         res_atom_idcs: Sequence[int],
         residue_definition: ResidueDefinition,
-    ) -> dict[str, int] | None:
+    ) -> ResidueMatch | None:
         # Raise an error if the returned dict would be empty - this way the
         # return value's truthiness always reflects whether there was a match
         if len(res_atom_idcs) == 0:
@@ -167,43 +223,88 @@ class PdbData:
 
         # Get the map from the canonical names to the indices
         try:
-            canonical_name_to_index = {
-                residue_definition.name_to_canonical_name[self.name[i]]: i
-                for i in res_atom_idcs
+            index_to_atomdef = {
+                i: residue_definition.name_to_atom[self.name[i]] for i in res_atom_idcs
             }
         except KeyError as e:
             print(
                 "name in pdb file missing from res def 1:",
                 e,
-                residue_definition.name_to_canonical_name,
+                {
+                    name: atom.name
+                    for name, atom in residue_definition.name_to_atom.items()
+                },
             )
             return None
 
-        # Fail to match if any atoms in PDB file didn't get matched to a name
-        if len(canonical_name_to_index) != len(res_atom_idcs):
-            print("name in pdb file missing from res def 2")
-            return None
+        matched_atoms = set(atom.name for atom in index_to_atomdef.values())
 
         # Fail to match if any atoms in PDB file got matched to more than one name
-        if len(set(canonical_name_to_index.values())) != len(res_atom_idcs):
+        if len(matched_atoms) != len(res_atom_idcs):
             print("name in pdb file with multiple matches in res def")
             return None
 
+        # This assert should be guaranteed by the above
+        assert set(index_to_atomdef.keys()) == set(res_atom_idcs)
+
+        missing_atoms = [
+            atom for atom in residue_definition.atoms if atom.name not in matched_atoms
+        ]
+
         # Match only if all atoms missing from the PDB file are leaving atoms
-        if all(
-            atom.leaving
-            for atom in residue_definition.atoms
-            if atom.name not in canonical_name_to_index
-        ):
+        if all(atom.leaving for atom in missing_atoms):
             print("matched!")
-            return canonical_name_to_index
+            return ResidueMatch(
+                index_to_atomdef=index_to_atomdef,
+                residue_definition=residue_definition,
+                missing_atoms={atom.name for atom in missing_atoms},
+            )
         else:
             print(
                 "missing atom is not leaving:",
-                [
-                    (atom.name, atom.synonyms, atom.leaving)
-                    for atom in residue_definition.atoms
-                    if atom.name in canonical_name_to_index
-                ],
+                [(atom.name, atom.synonyms, atom.leaving) for atom in missing_atoms],
             )
             return None
+
+    def get_residue_matches(
+        self,
+        residue_database: Mapping[str, list[ResidueDefinition]],
+    ) -> Iterator[list[ResidueMatch]]:
+        for res_atom_idcs in self.residues():
+            prototype_index = res_atom_idcs[0]
+            res_name = self.res_name[prototype_index]
+
+            print("matching new residue", res_name)
+
+            matches = []
+            for residue_definition in residue_database.get(res_name, []):
+                match = self.subset_matches_residue(
+                    res_atom_idcs,
+                    residue_definition,
+                )
+
+                if match is not None:
+                    matches.append(match)
+            yield matches
+
+    def are_alt_locs(self, i: int, j: int):
+        if i == j:
+            raise ValueError(f"i and j are the same ({i})")
+        if max(i, j) - min(i, j) == 1:
+            return (
+                self.model[i],
+                self.name[i],
+                self.res_name[i],
+                self.chain_id[i],
+                self.res_seq[i],
+                self.i_code[i],
+            ) == (
+                self.model[j],
+                self.name[j],
+                self.res_name[j],
+                self.chain_id[j],
+                self.res_seq[j],
+                self.i_code[j],
+            )
+        else:
+            return self.are_alt_locs(i, i + 1) and self.are_alt_locs(i + 1, j)

@@ -5,11 +5,13 @@ from pathlib import Path
 from openff.toolkit import Molecule, Topology
 from openff.units import elements
 
-from ._pdb_data import PdbData
-from ._pdb_molecule import PDBAtom, PDBBond, PDBMolecule
-from ._utils import __UNSET__, cryst_to_box_vectors
+from ._pdb_data import PdbData, ResidueMatch
+from ._utils import cryst_to_box_vectors, with_neighbours
 from .ccd import CCD_RESIDUE_DEFINITION_CACHE
-from .exceptions import NoMatchingResidueDefinitionError
+from .exceptions import (
+    MultipleMatchingResidueDefinitionsError,
+    NoMatchingResidueDefinitionError,
+)
 from .residue import ResidueDefinition
 
 __all__ = [
@@ -17,168 +19,100 @@ __all__ = [
 ]
 
 
-def _load_unknown_residue(
-    data: PdbData, indices: list[int], unknown_molecules: list[Molecule]
-) -> PDBMolecule:
-    atoms = []
-    conects = set()
-    serial_to_index = {}
-    for i, pdb_index in enumerate(indices):
-        new_atom = PDBAtom(
-            atomic_number=elements.NUMBERS[data.element[pdb_index]],
-            formal_charge=data.charge[pdb_index],
-            is_aromatic=None,
-            stereochemistry=None,
-            name=data.name[pdb_index],
-            x=data.x[pdb_index],
-            y=data.y[pdb_index],
-            z=data.z[pdb_index],
-            metadata={
-                "residue_name": data.res_name[pdb_index],
-                "leaving": False,
-                "pdb_index": pdb_index,
-                "residue_number": str(data.res_seq[pdb_index]),
-                "res_seq": data.res_seq[pdb_index],
-                "insertion_code": data.i_code[pdb_index],
-                "chain_id": data.chain_id[pdb_index],
-                "atom_serial": data.serial[pdb_index],
-            },
-        )
-        atoms.append(new_atom)
-        serial_to_index[data.serial[pdb_index]] = i
-        for conect_serial in data.conects[pdb_index]:
-            conects.add(tuple(sorted([data.serial[pdb_index], conect_serial])))
+# def _load_unknown_residue(
+#     data: PdbData, indices: list[int], unknown_molecules: list[Molecule]
+# ) -> PDBMolecule:
+#     atoms = []
+#     conects = set()
+#     serial_to_index = {}
+#     for i, pdb_index in enumerate(indices):
+#         new_atom = PDBAtom(
+#             atomic_number=elements.NUMBERS[data.element[pdb_index]],
+#             formal_charge=data.charge[pdb_index],
+#             is_aromatic=None,
+#             stereochemistry=None,
+#             name=data.name[pdb_index],
+#             x=data.x[pdb_index],
+#             y=data.y[pdb_index],
+#             z=data.z[pdb_index],
+#             metadata={
+#                 "residue_name": data.res_name[pdb_index],
+#                 "leaving": False,
+#                 "pdb_index": pdb_index,
+#                 "residue_number": str(data.res_seq[pdb_index]),
+#                 "res_seq": data.res_seq[pdb_index],
+#                 "insertion_code": data.i_code[pdb_index],
+#                 "chain_id": data.chain_id[pdb_index],
+#                 "atom_serial": data.serial[pdb_index],
+#             },
+#         )
+#         atoms.append(new_atom)
+#         serial_to_index[data.serial[pdb_index]] = i
+#         for conect_serial in data.conects[pdb_index]:
+#             conects.add(tuple(sorted([data.serial[pdb_index], conect_serial])))
 
-    bonds = []
-    for serial1, serial2 in conects:
-        bonds.append(
-            PDBBond(
-                atom1=serial_to_index[serial1],
-                atom2=serial_to_index[serial2],
-            )
-        )
+#     bonds = []
+#     for serial1, serial2 in conects:
+#         bonds.append(
+#             PDBBond(
+#                 atom1=serial_to_index[serial1],
+#                 atom2=serial_to_index[serial2],
+#             )
+#         )
 
-    pdbmol = PDBMolecule(
-        atoms=atoms,
-        bonds=bonds,
-        properties={"linking_bond": None},
-    )
+#     pdbmol = PDBMolecule(
+#         atoms=atoms,
+#         bonds=bonds,
+#         properties={"linking_bond": None},
+#     )
 
-    for molecule in unknown_molecules:
-        (match_found, mapping) = Molecule.are_isomorphic(
-            pdbmol.to_networkx(),
-            molecule.to_networkx(),
-            return_atom_map=True,
-            aromatic_matching=False,
-            formal_charge_matching=False,
-            bond_order_matching=False,
-            atom_stereochemistry_matching=False,
-            bond_stereochemistry_matching=False,
-            strip_pyrimidal_n_atom_stereo=True,
-        )
-        assert mapping is not None
-        if match_found:
-            reverse_map = {}
-            for i, atom in enumerate(pdbmol.atoms):
-                reverse_map[mapping[i]] = i
-                reference_atom = molecule.atom(mapping[i])
-                atom.formal_charge = reference_atom.formal_charge
-                atom.is_aromatic = reference_atom.is_aromatic
-                atom.stereochemistry = reference_atom.stereochemistry
-            pdbmol.bonds.clear()
-            for bond in molecule.bonds:
-                pdbmol.add_bond(
-                    PDBBond(
-                        atom1=reverse_map[bond.atom1_index],
-                        atom2=reverse_map[bond.atom2_index],
-                        bond_order=bond.bond_order,
-                        is_aromatic=bond.is_aromatic,
-                        stereochemistry=bond.stereochemistry,
-                    )
-                )
-            break
-    else:
-        res_name = pdbmol.atoms[0].metadata["residue_name"]
-        res_seq = pdbmol.atoms[0].metadata["res_seq"]
-        chain_id = pdbmol.atoms[0].metadata["chain_id"]
-        raise ValueError(
-            f"Unknown residue {chain_id}:{res_name}#{res_seq} could not be assigned chemistry from unknown_molecules"
-        )
+#     for molecule in unknown_molecules:
+#         (match_found, mapping) = Molecule.are_isomorphic(
+#             pdbmol.to_networkx(),
+#             molecule.to_networkx(),
+#             return_atom_map=True,
+#             aromatic_matching=False,
+#             formal_charge_matching=False,
+#             bond_order_matching=False,
+#             atom_stereochemistry_matching=False,
+#             bond_stereochemistry_matching=False,
+#             strip_pyrimidal_n_atom_stereo=True,
+#         )
+#         assert mapping is not None
+#         if match_found:
+#             reverse_map = {}
+#             for i, atom in enumerate(pdbmol.atoms):
+#                 reverse_map[mapping[i]] = i
+#                 reference_atom = molecule.atom(mapping[i])
+#                 atom.formal_charge = reference_atom.formal_charge
+#                 atom.is_aromatic = reference_atom.is_aromatic
+#                 atom.stereochemistry = reference_atom.stereochemistry  # type: ignore[assignment]
+#             pdbmol.bonds.clear()
+#             for bond in molecule.bonds:
+#                 pdbmol.add_bond(
+#                     PDBBond(
+#                         atom1=reverse_map[bond.atom1_index],
+#                         atom2=reverse_map[bond.atom2_index],
+#                         bond_order=bond.bond_order,
+#                         is_aromatic=bond.is_aromatic,
+#                         stereochemistry=bond.stereochemistry,
+#                     )
+#                 )
+#             break
+#     else:
+#         res_name = pdbmol.atoms[0].metadata["residue_name"]
+#         res_seq = pdbmol.atoms[0].metadata["res_seq"]
+#         chain_id = pdbmol.atoms[0].metadata["chain_id"]
+#         raise ValueError(
+#             f"Unknown residue {chain_id}:{res_name}#{res_seq} could not be assigned chemistry from unknown_molecules"
+#         )
 
-    return pdbmol
-
-
-def _load_residue_from_database(
-    data: PdbData,
-    res_atom_idcs: list[int],
-    residue_database: Mapping[str, list[ResidueDefinition]],
-) -> PDBMolecule:
-    prototype_index = res_atom_idcs[0]
-
-    res_name = data.res_name[prototype_index]
-    res_seq = data.res_seq[prototype_index]
-    chain_id = data.chain_id[prototype_index]
-    i_code = data.i_code[prototype_index]
-
-    print(f"matching atom names {[data.name[i] for i in res_atom_idcs]}")
-    matching_definitions: list[tuple[ResidueDefinition, dict[str, int]]] = []
-    for residue_definition in residue_database[res_name]:
-        print(
-            "    ... to residue definition with atoms ",
-            [
-                (atom.name, *atom.synonyms, f"{atom.leaving=}")
-                for atom in residue_definition.atoms
-            ],
-            "...",
-            sep="",
-            end="",
-        )
-        canonical_name_to_index = data.subset_matches_residue(
-            res_atom_idcs,
-            residue_definition,
-        )
-        if canonical_name_to_index is not None:
-            # TODO: Consider checking all definitions and raising an error if multiple match
-            matching_definitions.append((residue_definition, canonical_name_to_index))
-    if len(matching_definitions) == 0:
-        raise NoMatchingResidueDefinitionError(res_name, res_seq, chain_id, i_code)
-
-    # TODO: Pick the right residue definition
-    residue_definition, canonical_name_to_index = matching_definitions[0]
-    residue = residue_definition.to_pdb_molecule()
-
-    residue_wide_metadata = {
-        "residue_number": str(res_seq),
-        "res_seq": res_seq,
-        "insertion_code": i_code,
-        "chain_id": chain_id,
-    }
-    for atom in residue.atoms:
-        pdb_index = canonical_name_to_index[atom.name]
-        atom.x = data.x[pdb_index]
-        atom.y = data.y[pdb_index]
-        atom.z = data.z[pdb_index]
-        atom_specific_metadata = {
-            "pdb_index": pdb_index,
-            "used_synonym": data.name[pdb_index],
-            "canonical_name": atom.name,
-            "atom_serial": data.serial[pdb_index],
-            "matched_residue_description": residue_definition.description,
-            "b_factor": data.temp_factor[pdb_index],
-            "occupancy": data.occupancy[pdb_index],
-        }
-
-        atom.metadata.update(residue_wide_metadata | atom_specific_metadata)
-
-    residue.sort_atoms_by_metadata("pdb_index")
-
-    return residue
+#     return pdbmol
 
 
 def topology_from_pdb(
     path: PathLike,
     use_canonical_names: bool = False,
-    unknown_molecules: list[Molecule] = [],
     residue_database: Mapping[
         str, list[ResidueDefinition]
     ] = CCD_RESIDUE_DEFINITION_CACHE,
@@ -237,6 +171,8 @@ def topology_from_pdb(
     The following metadata are specified for all atoms produced by this function
     and can be accessed via ``topology.atom(i).metadata[key]``:
 
+    ``"residue_name"``
+        The residue name
     ``"residue_number"``
         The residue number as a string
     ``"res_seq"``
@@ -272,61 +208,121 @@ def topology_from_pdb(
     path = Path(path)
     data = PdbData.parse_pdb(path.read_text().splitlines())
 
-    # TODO: Refactor this into multiple loops, something like:
-    #       - get all possible matches for each residue
-    #       - filter down possible matches accounting for adjacent residues
-    #       - apply unique_molecules
-    #       - apply additional_substructures
-    #       - break matches into molecules and convert to `openff.toolkit.Molecule`s
+    prev_filtered_matches: list[ResidueMatch] = []
+    matched_residues: list[ResidueMatch] = []
+    # TODO: Refactor into loop over with_neighbours(data.residues()) by combining matching logic
+    for _, this_matches, next_matches in with_neighbours(
+        data.get_residue_matches(residue_database),
+        [],
+    ):
+        this_filtered_matches = []
+        for match in this_matches:
+            # TODO: Simplify this and factor out into function with logic in PdbData.subset_matches_residue
+            if len(match.missing_atoms) != 0:
+                prior_bond_mismatched = match.expect_prior_bond != any(
+                    prev_match.expect_posterior_bond
+                    for prev_match in prev_filtered_matches
+                )
+                if prior_bond_mismatched:
+                    continue
 
-    molecules: list[PDBMolecule] = []
-    current_molecule = PDBMolecule()
-    prev_chain_id = __UNSET__
-    prev_model = __UNSET__
-    # Chunk atom indices into residues and iterate over them (see PdbData.residues())
-    for res_atom_idcs in data.residues():
-        prototype_index = res_atom_idcs[0]
-        res_name = data.res_name[prototype_index]
+                # assert any([]) == False
+                posterior_bond_mismatched = match.expect_posterior_bond != any(
+                    next_match.expect_prior_bond for next_match in next_matches
+                )
+                if posterior_bond_mismatched:
+                    continue
 
-        # If this is the first residue, we'll need to initialize the variables
-        # that refer to the previous residue as though the previous residue
-        # was in the same chain and model (imagine there's an empty zeroth
-        # residue)
-        if prev_chain_id is __UNSET__:
-            prev_chain_id = data.chain_id[prototype_index]
-        if prev_model is __UNSET__:
-            prev_model = data.model[prototype_index]
+            this_filtered_matches.append(match)
 
-        # Identify this residue and get a PDBMolecule of it
-        # TODO: UNK is for unknown peptide residues, but we just treat it as a ligand
-        # Note that for the CCD_RESIDUE_DEFINITION_CACHE, "not in" includes a check
-        # for the residue names "UNL" and "UNK"
-        if res_name not in residue_database:
-            residue = _load_unknown_residue(data, res_atom_idcs, unknown_molecules)
+        if len(this_filtered_matches) == 0:
+            # TODO: Implement unique_molecules and additional_substructures here
+            raise NoMatchingResidueDefinitionError()
+        elif len(this_filtered_matches) == 1:
+            matched_residues.append(this_filtered_matches[0])
         else:
-            residue = _load_residue_from_database(data, res_atom_idcs, residue_database)
+            raise MultipleMatchingResidueDefinitionsError()
+
+        prev_filtered_matches = this_filtered_matches
+
+    # Now, we convert to OpenFF molecules
+    molecules: list[Molecule] = []
+    this_molecule = Molecule()
+    pdb_index_to_molecule_index = {}
+    prev_chain_id = data.chain_id[0]
+    prev_model = data.model[0]
+    conformer: list[tuple[float, float, float] | None] = []
+    for res_atom_idcs, residue_match in zip(data.residues(), matched_residues):
+        # this is a debug assert, if it triggers there's a bug
+        assert set(res_atom_idcs) == residue_match.res_atom_idcs
+
+        prototype_index = res_atom_idcs[0]
+
+        res_seq = data.res_seq[prototype_index]
+        residue_wide_metadata = {
+            "residue_name": data.res_name[prototype_index],
+            "res_seq": res_seq,
+            "residue_number": str(res_seq),
+            "insertion_code": data.i_code[prototype_index],
+            "chain_id": data.chain_id[prototype_index],
+        }
 
         # Terminate the previous molecule and start a new one if we can see that
         # this is the start of a new molecule
-        if (
-            residue.properties["linking_bond"] is None
-            or data.chain_id[prototype_index] != prev_chain_id
+        if this_molecule.n_atoms > 0 and (
+            data.chain_id[prototype_index] != prev_chain_id
             or data.model[prototype_index] != prev_model
+            or not residue_match.expect_prior_bond
         ):
-            molecules.append(current_molecule)
-            current_molecule = PDBMolecule()
+            this_molecule._invalidate_cached_properties()
+            molecules.append(this_molecule)
+            this_molecule = Molecule()
 
-        # Add the PDBMolecule matching the current residue to the growing molecule
-        # TODO: Test that atoms are never re-ordered
-        current_molecule.combine_with(residue)
+        # Add the residue to the current molecule
+        # TODO: Break this into a function
+        for pdb_index in res_atom_idcs:
+            atom_def = residue_match.atom(pdb_index)
+
+            if data.alt_loc[pdb_index] != "":
+                # TODO: Support altlocs (probably in PdbData, maybe PdbData.residues()?)
+                raise ValueError("altloc not yet supported")
+
+            xyz = (data.x[pdb_index], data.y[pdb_index], data.z[pdb_index])
+            conformer.append(xyz)
+
+            pdb_index_to_molecule_index[pdb_index] = this_molecule._add_atom(
+                atomic_number=elements.NUMBERS[atom_def.symbol],
+                formal_charge=atom_def.charge,
+                is_aromatic=atom_def.aromatic,
+                stereochemistry=atom_def.stereo,
+                name=atom_def.name if use_canonical_names else data.name[pdb_index],
+                metadata={
+                    **residue_wide_metadata,
+                    "pdb_index": pdb_index,
+                    "used_synonym": data.name[pdb_index],
+                    "canonical_name": atom_def.name,
+                    "atom_serial": data.serial[pdb_index],
+                    "matched_residue_description": residue_match.residue_definition.description,
+                    "b_factor": data.temp_factor[pdb_index],
+                    "occupancy": data.occupancy[pdb_index],
+                },
+                invalidate_cache=False,
+            )
+
+        for bond in residue_match.residue_definition.bonds:
+            this_molecule._add_bond(
+                atom1=residue_match.atom(bond.atom1),
+                atom2=residue_match.atom(bond.atom2),
+                bond_order=bond.order,
+                is_aromatic=bond.aromatic,
+                stereochemistry=None,  # TODO: Calculate stereo from coords
+                invalidate_cache=False,
+            )
 
         # Terminate the current molecule if we can see that this is the last residue
-        if (
-            data.terminated[prototype_index]
-            or current_molecule.properties["linking_bond"] is None
-        ):
-            molecules.append(current_molecule)
-            current_molecule = PDBMolecule()
+        if data.terminated[prototype_index] or not residue_match.expect_posterior_bond:
+            molecules.append(this_molecule)
+            this_molecule = Molecule()
 
         # TODO: Load other data from PDB file
         # TODO: Incorporate CONECT records
@@ -335,14 +331,12 @@ def topology_from_pdb(
         prev_chain_id = data.chain_id[prototype_index]
         prev_model = data.model[prototype_index]
 
-    if not use_canonical_names:
-        for molecule in molecules:
-            for atom in molecule.atoms:
-                atom.name = atom.metadata.get("used_synonym", atom.name)
+    for offmol in molecules:
+        offmol._invalidate_cached_properties()
+        offmol.add_default_hierarchy_schemes()
+    molecules.append(this_molecule)
 
-    topology = Topology.from_molecules(
-        [pdbmol.to_openff_molecule() for pdbmol in molecules]
-    )
+    topology = Topology.from_molecules(molecules)  # type: ignore[call-arg]
     if (
         data.cryst1_a is not None
         and data.cryst1_b is not None
@@ -359,7 +353,5 @@ def topology_from_pdb(
             data.cryst1_beta,
             data.cryst1_gamma,
         )
-    for offmol in topology.molecules:
-        offmol.add_default_hierarchy_schemes()
 
     return topology

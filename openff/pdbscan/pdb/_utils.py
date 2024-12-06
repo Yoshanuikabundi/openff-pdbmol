@@ -1,6 +1,6 @@
-from typing import Iterable, TypeVar
+from typing import Iterable, Iterator, TypeVar
 
-from openff.units import unit
+from openff.units import Quantity, unit
 
 __all__ = [
     "unwrap",
@@ -12,6 +12,7 @@ __all__ = [
 ]
 
 T = TypeVar("T")
+U = TypeVar("U")
 
 
 class __UNSET__:
@@ -40,9 +41,32 @@ def unwrap(container: Iterable[T], msg: str = "") -> T:
     raise ValueError(msg + "container has multiple elements")
 
 
-def flatten(container: Iterable[Iterable[T]]) -> Iterable[T]:
+def flatten(container: Iterable[Iterable[T]]) -> Iterator[T]:
     for inner in container:
         yield from inner
+
+
+def with_neighbours(
+    iterable: Iterable[T], default: U = None
+) -> Iterator[tuple[T | U, T, T | U]]:
+    iterator = iter(iterable)
+
+    pred: T | U = default
+    this: T
+    succ: T | U
+
+    try:
+        this = next(iterator)
+    except StopIteration:
+        return
+
+    for succ in iterator:
+        yield (pred, this, succ)
+        pred = this
+        this = succ
+
+    succ = default
+    yield (pred, this, succ)
 
 
 def float_or_unknown(s: str) -> float | None:
@@ -90,9 +114,12 @@ def dec_hex(s: str) -> int:
 
 def cryst_to_box_vectors(
     a: float, b: float, c: float, alpha: float, beta: float, gamma: float
-) -> unit.Quantity:
+) -> Quantity:  # type: ignore[invalid-type]
     import openmm.unit
     from openmm.app.internal.unitcell import computePeriodicBoxVectors
+    from openmm.unit import (
+        nanometer as openmm_unit_nanometer,  # type: ignore[import-not-found]
+    )
 
     box_vectors = computePeriodicBoxVectors(
         openmm.unit.Quantity(a, openmm.unit.angstrom),
@@ -102,4 +129,4 @@ def cryst_to_box_vectors(
         openmm.unit.Quantity(beta, openmm.unit.degree),
         openmm.unit.Quantity(gamma, openmm.unit.degree),
     )
-    return box_vectors.value_in_unit(openmm.unit.nanometer) * unit.nanometer
+    return box_vectors.value_in_unit(openmm_unit_nanometer) * unit.nanometer
