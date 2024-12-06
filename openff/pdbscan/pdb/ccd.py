@@ -2,25 +2,28 @@
 Tools for reading and patching the PDB Chemical Component Dictionary (CCD).
 """
 
+import dataclasses
 import gzip
 from copy import deepcopy
+from io import StringIO
 from pathlib import Path
 from typing import Callable, Iterator, Mapping
 from urllib.request import urlopen
 
-from openff.pdbscan.pdb._bond_definition import PEPTIDE_BOND
+from openmm.app.internal.pdbx.reader.PdbxReader import PdbxReader
 
 from ._utils import flatten, unwrap
-from .residue import ResidueDefinition
+from .residue import AtomDefinition, BondDefinition, ResidueDefinition
 
 __all__ = [
-    "CCD_RESIDUE_DEFINITION_CACHE",
     "CcdCache",
     "fix_caps",
     "ATOM_NAME_SYNONYMS",
     "add_synonyms",
     "disambiguate_alt_ids",
     "combine_patches",
+    "PEPTIDE_BOND",
+    "LINKING_TYPES",
 ]
 
 
@@ -99,7 +102,7 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         return list(flatten(patch_res(res) for res in patch_all(definition)))
 
     def _add_definition_from_str(self, s: str, res_name: str | None = None) -> None:
-        definition = ResidueDefinition.from_ccd_str(s)
+        definition = self._res_def_from_ccd_str(s)
         if res_name is None:
             res_name = definition.residue_name.upper()
 
@@ -138,6 +141,77 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         path.write_text(s)
         return s
 
+    @staticmethod
+    def _res_def_from_ccd_str(s: str) -> ResidueDefinition:
+        # TODO: Handle residues like CL with a single atom properly (no tables)
+        data = []
+        with StringIO(s) as file:
+            PdbxReader(file).read(data)
+        block = data[0]
+
+        residueName = (
+            block.getObj("chem_comp").getValue("mon_nstd_parent_comp_id").upper()
+        )
+        if residueName == "?":
+            residueName = block.getObj("chem_comp").getValue("id").upper()
+        residue_description = block.getObj("chem_comp").getValue("name")
+        linking_type = block.getObj("chem_comp").getValue("type").upper()
+        linking_bond = LINKING_TYPES[linking_type]
+
+        atomData = block.getObj("chem_comp_atom")
+        atomNameCol = atomData.getAttributeIndex("atom_id")
+        altAtomNameCol = atomData.getAttributeIndex("alt_atom_id")
+        symbolCol = atomData.getAttributeIndex("type_symbol")
+        leavingCol = atomData.getAttributeIndex("pdbx_leaving_atom_flag")
+        chargeCol = atomData.getAttributeIndex("charge")
+        aromaticCol = atomData.getAttributeIndex("pdbx_aromatic_flag")
+        stereoCol = atomData.getAttributeIndex("pdbx_stereo_config")
+
+        atoms = [
+            AtomDefinition(
+                name=row[atomNameCol],
+                synonyms=(
+                    [row[altAtomNameCol]]
+                    if row[altAtomNameCol] != row[atomNameCol]
+                    else []
+                ),
+                symbol=row[symbolCol][0:1].upper() + row[symbolCol][1:].lower(),
+                leaving=row[leavingCol] == "Y",
+                charge=int(row[chargeCol]),
+                aromatic=row[aromaticCol] == "Y",
+                stereo=None if row[stereoCol] == "N" else row[stereoCol],
+            )
+            for row in atomData.getRowList()
+        ]
+
+        bondData = block.getObj("chem_comp_bond")
+        if bondData is not None:
+            atom1Col = bondData.getAttributeIndex("atom_id_1")
+            atom2Col = bondData.getAttributeIndex("atom_id_2")
+            orderCol = bondData.getAttributeIndex("value_order")
+            aromaticCol = bondData.getAttributeIndex("pdbx_aromatic_flag")
+            stereoCol = bondData.getAttributeIndex("pdbx_stereo_config")
+            bonds = [
+                BondDefinition(
+                    atom1=row[atom1Col],
+                    atom2=row[atom2Col],
+                    order={"SING": 1, "DOUB": 2, "TRIP": 3, "QUAD": 4}[row[orderCol]],
+                    aromatic=row[aromaticCol] == "Y",
+                    stereo=None if row[stereoCol] == "N" else row[stereoCol],
+                )
+                for row in bondData.getRowList()
+            ]
+        else:
+            bonds = []
+
+        return ResidueDefinition(
+            residue_name=residueName,
+            description=residue_description,
+            linking_bond=linking_bond,
+            atoms=atoms,
+            bonds=bonds,
+        )
+
     def __contains__(self, value) -> bool:
         if value in self._definitions:
             return True
@@ -161,15 +235,20 @@ def fix_caps(res: ResidueDefinition) -> list[ResidueDefinition]:
     """
     Fix ``"NON-POLYMER"`` residues so they can be used as caps for peptides.
     """
-    res.linking_bond = PEPTIDE_BOND
 
-    if res.residue_name == "ACE":
-        for atom in res.atoms:
-            if atom.name == "H":
-                atom.leaving = True
-                break
-
-    return [res]
+    return [
+        dataclasses.replace(
+            res,
+            linking_bond=PEPTIDE_BOND,
+            atoms=[
+                dataclasses.replace(
+                    atom,
+                    leaving=True if atom.name == "H" else atom.leaving,
+                )
+                for atom in res.atoms
+            ],
+        )
+    ]
 
 
 ATOM_NAME_SYNONYMS = {
@@ -194,8 +273,8 @@ def disambiguate_alt_ids(res: ResidueDefinition) -> list[ResidueDefinition]:
     CCD patch: put alt atom ids in their own residue definitions if needed
 
     This patch should be run before other patches that add synonyms, as it
-    assumes that there is at most one synonym that came from the CCD alt id
-    flag.
+    assumes that there is at most one synonym (from the CCD alt id
+    flag).
 
     Some CCD residues (like GLY) have alternative atom IDs that clash with
     canonical IDs for a different atom. This breaks synonyms because the
@@ -212,21 +291,43 @@ def disambiguate_alt_ids(res: ResidueDefinition) -> list[ResidueDefinition]:
                 clashes.append(i)
 
     if clashes:
-        res2 = deepcopy(res)
         old_to_new = {}
-        for atom in res2.atoms:
-            old_to_new[atom.name] = atom.name
+        for atom in res.atoms:
             if atom.synonyms:
-                synonym = unwrap(atom.synonyms)
-                old_to_new[atom.name] = synonym
-                atom.name = synonym
-                atom.synonyms = []
-        for bond in res2.bonds:
-            bond.atom1 = old_to_new[bond.atom1]
-            bond.atom2 = old_to_new[bond.atom2]
-        for clash in clashes:
-            res.atoms[clash].synonyms = []
-        return [res, res2]
+                old_to_new[atom.name] = unwrap(atom.synonyms)
+            else:
+                old_to_new[atom.name] = atom.name
+
+        res1 = dataclasses.replace(
+            res,
+            atoms=[
+                dataclasses.replace(
+                    atom,
+                    synonyms=[] if i in clashes else deepcopy(atom.synonyms),
+                )
+                for i, atom in enumerate(res.atoms)
+            ],
+        )
+        res2 = dataclasses.replace(
+            res,
+            atoms=[
+                dataclasses.replace(
+                    atom,
+                    name=old_to_new[atom.name],
+                    synonyms=[] if atom.synonyms else deepcopy(atom.synonyms),
+                )
+                for atom in res.atoms
+            ],
+            bonds=[
+                dataclasses.replace(
+                    bond,
+                    atom1=old_to_new[bond.atom1],
+                    atom2=old_to_new[bond.atom2],
+                )
+                for bond in res.bonds
+            ],
+        )
+        return [res1, res2]
     else:
         return [res]
 
@@ -245,6 +346,42 @@ def combine_patches(
                 combined[key] = fn
     return combined
 
+
+# TODO: Fill in this data
+PEPTIDE_BOND = BondDefinition(
+    atom1="C", atom2="N", order=1, aromatic=False, stereo=None
+)
+LINKING_TYPES: dict[str, BondDefinition | None] = {
+    # "D-beta-peptide, C-gamma linking".upper(): [],
+    # "D-gamma-peptide, C-delta linking".upper(): [],
+    # "D-peptide COOH carboxy terminus".upper(): [],
+    # "D-peptide NH3 amino terminus".upper(): [],
+    # "D-peptide linking".upper(): [],
+    # "D-saccharide".upper(): [],
+    # "D-saccharide, alpha linking".upper(): [],
+    # "D-saccharide, beta linking".upper(): [],
+    # "DNA OH 3 prime terminus".upper(): [],
+    # "DNA OH 5 prime terminus".upper(): [],
+    # "DNA linking".upper(): [],
+    # "L-DNA linking".upper(): [],
+    # "L-RNA linking".upper(): [],
+    # "L-beta-peptide, C-gamma linking".upper(): [],
+    # "L-gamma-peptide, C-delta linking".upper(): [],
+    # "L-peptide COOH carboxy terminus".upper(): [],
+    # "L-peptide NH3 amino terminus".upper(): [],
+    "L-peptide linking".upper(): PEPTIDE_BOND,
+    # "L-saccharide".upper(): [],
+    # "L-saccharide, alpha linking".upper(): [],
+    # "L-saccharide, beta linking".upper(): [],
+    # "RNA OH 3 prime terminus".upper(): [],
+    # "RNA OH 5 prime terminus".upper(): [],
+    # "RNA linking".upper(): [],
+    "non-polymer".upper(): None,
+    # "other".upper(): [],
+    "peptide linking".upper(): PEPTIDE_BOND,
+    "peptide-like".upper(): PEPTIDE_BOND,
+    # "saccharide".upper(): [],
+}
 
 # TODO: Replace these patches with CONECT records?
 CCD_RESIDUE_DEFINITION_CACHE = CcdCache(

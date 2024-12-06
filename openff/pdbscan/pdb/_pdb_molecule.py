@@ -1,6 +1,5 @@
 # TODO: Replace this with openff molecules?
 
-from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import (

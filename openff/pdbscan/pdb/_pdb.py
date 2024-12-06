@@ -120,36 +120,31 @@ def _load_residue_from_database(
     chain_id = data.chain_id[prototype_index]
     i_code = data.i_code[prototype_index]
 
+    print(f"matching atom names {[data.name[i] for i in res_atom_idcs]}")
+    matching_definitions: list[tuple[ResidueDefinition, dict[str, int]]] = []
     for residue_definition in residue_database[res_name]:
-        # Skip definitions with the wrong number of atoms
-        if len(residue_definition.atoms) != len(res_atom_idcs):
-            continue
-
-        # Construct a map from an atom's canonical name in this definition
-        # to its index in the PDB file. This accounts for synonyms defined in
-        # the residue database. If a name is not in the current definition,
-        # no canonical name will be found and the definition can be skipped
-        try:
-            canonical_name_to_index = {
-                residue_definition.name_to_canonical_name[data.name[i]]: i
-                for i in res_atom_idcs
-            }
-        except KeyError:
-            continue
-
-        # We now know that this definition has the right number of atoms and
-        # that each atom name in the PDB file has a match, so we just need
-        # to make sure there are no double matches and then we've found the
-        # right residue definition
-        if len(canonical_name_to_index) != len(res_atom_idcs):
-            continue
-
-        # We've found a matching residue, no need to keep looking
-        # TODO: Consider checking all definitions and raising an error if multiple match
-        break
-    else:
+        print(
+            "    ... to residue definition with atoms ",
+            [
+                (atom.name, *atom.synonyms, f"{atom.leaving=}")
+                for atom in residue_definition.atoms
+            ],
+            "...",
+            sep="",
+            end="",
+        )
+        canonical_name_to_index = data.subset_matches_residue(
+            res_atom_idcs,
+            residue_definition,
+        )
+        if canonical_name_to_index is not None:
+            # TODO: Consider checking all definitions and raising an error if multiple match
+            matching_definitions.append((residue_definition, canonical_name_to_index))
+    if len(matching_definitions) == 0:
         raise NoMatchingResidueDefinitionError(res_name, res_seq, chain_id, i_code)
 
+    # TODO: Pick the right residue definition
+    residue_definition, canonical_name_to_index = matching_definitions[0]
     residue = residue_definition.to_pdb_molecule()
 
     residue_wide_metadata = {
@@ -276,6 +271,13 @@ def topology_from_pdb(
     # TODO: support streams and gzipped files
     path = Path(path)
     data = PdbData.parse_pdb(path.read_text().splitlines())
+
+    # TODO: Refactor this into multiple loops, something like:
+    #       - get all possible matches for each residue
+    #       - filter down possible matches accounting for adjacent residues
+    #       - apply unique_molecules
+    #       - apply additional_substructures
+    #       - break matches into molecules and convert to `openff.toolkit.Molecule`s
 
     molecules: list[PDBMolecule] = []
     current_molecule = PDBMolecule()

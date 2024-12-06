@@ -1,8 +1,9 @@
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Self
+from typing import Any, Iterable, Self, Sequence
 
 from ._utils import __UNSET__, dec_hex
+from .residue import ResidueDefinition
 
 
 @dataclass
@@ -141,3 +142,68 @@ class PdbData:
             field.name: getattr(self, field.name)[index]
             for field in dataclasses.fields(self)
         }
+
+    def subset_matches_residue(
+        self,
+        res_atom_idcs: Sequence[int],
+        residue_definition: ResidueDefinition,
+    ) -> dict[str, int] | None:
+        # Raise an error if the returned dict would be empty - this way the
+        # return value's truthiness always reflects whether there was a match
+        if len(res_atom_idcs) == 0:
+            raise ValueError("cannot match empty res_atom_idcs")
+
+        # Skip definitions with too few atoms
+        if len(residue_definition.atoms) < len(res_atom_idcs):
+            print("res def has too few atoms")
+            return None
+
+        # Skip non-linking definitions with the wrong number of atoms
+        if residue_definition.linking_bond is None and len(
+            residue_definition.atoms
+        ) != len(res_atom_idcs):
+            print("nonlinking res def has wrong number of atoms")
+            return None
+
+        # Get the map from the canonical names to the indices
+        try:
+            canonical_name_to_index = {
+                residue_definition.name_to_canonical_name[self.name[i]]: i
+                for i in res_atom_idcs
+            }
+        except KeyError as e:
+            print(
+                "name in pdb file missing from res def 1:",
+                e,
+                residue_definition.name_to_canonical_name,
+            )
+            return None
+
+        # Fail to match if any atoms in PDB file didn't get matched to a name
+        if len(canonical_name_to_index) != len(res_atom_idcs):
+            print("name in pdb file missing from res def 2")
+            return None
+
+        # Fail to match if any atoms in PDB file got matched to more than one name
+        if len(set(canonical_name_to_index.values())) != len(res_atom_idcs):
+            print("name in pdb file with multiple matches in res def")
+            return None
+
+        # Match only if all atoms missing from the PDB file are leaving atoms
+        if all(
+            atom.leaving
+            for atom in residue_definition.atoms
+            if atom.name not in canonical_name_to_index
+        ):
+            print("matched!")
+            return canonical_name_to_index
+        else:
+            print(
+                "missing atom is not leaving:",
+                [
+                    (atom.name, atom.synonyms, atom.leaving)
+                    for atom in residue_definition.atoms
+                    if atom.name in canonical_name_to_index
+                ],
+            )
+            return None

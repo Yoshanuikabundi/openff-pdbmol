@@ -5,7 +5,6 @@ Classes for defining custom residues.
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import cached_property
-from io import StringIO
 from typing import (
     Collection,
     Literal,
@@ -13,12 +12,9 @@ from typing import (
     Self,
 )
 
-from openmm.app.internal.pdbx.reader.PdbxReader import PdbxReader
-
 from openff.toolkit import Molecule
 from openff.units import elements
 
-from ._bond_definition import LINKING_TYPES, BondDefinition
 from ._pdb_molecule import PDBAtom, PDBBond, PDBMolecule
 
 __all__ = [
@@ -28,7 +24,7 @@ __all__ = [
 ]
 
 
-@dataclass
+@dataclass(frozen=True)
 class AtomDefinition:
     """
     Description of an atom in a residue from the Chemical Component Dictionary (CCD).
@@ -43,7 +39,20 @@ class AtomDefinition:
     stereo: Literal["S", "R"] | None
 
 
-@dataclass
+@dataclass(frozen=True)
+class BondDefinition:
+    """
+    Description of a bond in a residue from the Chemical Component Dictionary (CCD).
+    """
+
+    atom1: str
+    atom2: str
+    order: int
+    aromatic: bool
+    stereo: Literal["E", "Z"] | None
+
+
+@dataclass(frozen=True)
 class ResidueDefinition:
     """
     Description of a residue from the Chemical Component Dictionary (CCD).
@@ -55,77 +64,11 @@ class ResidueDefinition:
     atoms: list[AtomDefinition]
     bonds: list[BondDefinition]
 
-    @classmethod
-    def from_ccd_str(cls, s) -> Self:
-        # TODO: Handle residues like CL with a single atom properly (no tables)
-        data = []
-        with StringIO(s) as file:
-            PdbxReader(file).read(data)
-        block = data[0]
-
-        residueName = (
-            block.getObj("chem_comp").getValue("mon_nstd_parent_comp_id").upper()
-        )
-        if residueName == "?":
-            residueName = block.getObj("chem_comp").getValue("id").upper()
-        residue_description = block.getObj("chem_comp").getValue("name")
-        linking_type = block.getObj("chem_comp").getValue("type").upper()
-        linking_bond = LINKING_TYPES[linking_type]
-
-        atomData = block.getObj("chem_comp_atom")
-        atomNameCol = atomData.getAttributeIndex("atom_id")
-        altAtomNameCol = atomData.getAttributeIndex("alt_atom_id")
-        symbolCol = atomData.getAttributeIndex("type_symbol")
-        leavingCol = atomData.getAttributeIndex("pdbx_leaving_atom_flag")
-        chargeCol = atomData.getAttributeIndex("charge")
-        aromaticCol = atomData.getAttributeIndex("pdbx_aromatic_flag")
-        stereoCol = atomData.getAttributeIndex("pdbx_stereo_config")
-
-        atoms = [
-            AtomDefinition(
-                name=row[atomNameCol],
-                synonyms=(
-                    [row[altAtomNameCol]]
-                    if row[altAtomNameCol] != row[atomNameCol]
-                    else []
-                ),
-                symbol=row[symbolCol][0:1].upper() + row[symbolCol][1:].lower(),
-                leaving=row[leavingCol] == "Y",
-                charge=int(row[chargeCol]),
-                aromatic=row[aromaticCol] == "Y",
-                stereo=None if row[stereoCol] == "N" else row[stereoCol],
+    def __post_init__(self):
+        if self.linking_bond is None and True in {atom.leaving for atom in self.atoms}:
+            raise ValueError(
+                "Leaving atoms were specififed, but there is no linking bond"
             )
-            for row in atomData.getRowList()
-        ]
-
-        bondData = block.getObj("chem_comp_bond")
-        if bondData is not None:
-            atom1Col = bondData.getAttributeIndex("atom_id_1")
-            atom2Col = bondData.getAttributeIndex("atom_id_2")
-            orderCol = bondData.getAttributeIndex("value_order")
-            aromaticCol = bondData.getAttributeIndex("pdbx_aromatic_flag")
-            stereoCol = bondData.getAttributeIndex("pdbx_stereo_config")
-            bonds = [
-                BondDefinition(
-                    atom1=row[atom1Col],
-                    atom2=row[atom2Col],
-                    order={"SING": 1, "DOUB": 2, "TRIP": 3, "QUAD": 4}[row[orderCol]],
-                    aromatic=row[aromaticCol] == "Y",
-                    stereo=None if row[stereoCol] == "N" else row[stereoCol],
-                )
-                for row in bondData.getRowList()
-            ]
-        else:
-            bonds = []
-
-        ret = cls(
-            residue_name=residueName,
-            description=residue_description,
-            linking_bond=linking_bond,
-            atoms=atoms,
-            bonds=bonds,
-        )
-        return ret
 
     @classmethod
     def from_molecule(
@@ -283,8 +226,8 @@ class ResidueDefinition:
     @cached_property
     def name_to_canonical_name(self) -> dict[str, str]:
         """Map from each atoms' name and synonyms to its name."""
-        mapping = {}
         canonical_names = {atom.name for atom in self.atoms}
+        mapping = {name: name for name in canonical_names}
         for atom in self.atoms:
             for synonym in atom.synonyms:
                 if synonym in mapping and mapping[synonym] != atom.name:
