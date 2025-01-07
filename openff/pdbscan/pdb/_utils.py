@@ -1,6 +1,8 @@
 from typing import Iterable, Iterator, TypeVar
 
-from openff.units import Quantity, unit
+from pint import Quantity
+
+from openff.units import unit
 
 __all__ = [
     "unwrap",
@@ -114,7 +116,7 @@ def dec_hex(s: str) -> int:
 
 def cryst_to_box_vectors(
     a: float, b: float, c: float, alpha: float, beta: float, gamma: float
-) -> Quantity:  # type: ignore[invalid-type]
+) -> Quantity:
     import openmm.unit
     from openmm.app.internal.unitcell import computePeriodicBoxVectors
     from openmm.unit import (

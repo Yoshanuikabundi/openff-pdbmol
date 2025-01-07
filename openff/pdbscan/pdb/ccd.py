@@ -212,9 +212,13 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
             bonds=tuple(bonds),
         )
 
-    def __contains__(self, value) -> bool:
+    def __contains__(self, value: object) -> bool:
         if value in self._definitions:
             return True
+        if not isinstance(value, str):
+            raise TypeError(
+                f"CcdCache contains residue names of type str, not {type(value)}"
+            )
 
         try:
             self[value]

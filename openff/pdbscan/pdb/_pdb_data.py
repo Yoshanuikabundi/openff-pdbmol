@@ -172,7 +172,8 @@ class PdbData:
 
         return data
 
-    def residues(self):
+    @property
+    def residue_indices(self) -> Iterator[tuple[int, ...]]:
         indices = []
         prev = None
         for atom_idx, residue_info in enumerate(
@@ -187,13 +188,34 @@ class PdbData:
             if prev == residue_info or prev is None:
                 indices.append(atom_idx)
             else:
-                yield indices
+                yield tuple(indices)
                 indices = [atom_idx]
             prev = residue_info
 
-        yield indices
+        yield tuple(indices)
 
-    def __getitem__(self, index) -> dict[str, Any]:
+    def get_residue_matches(
+        self,
+        residue_database: Mapping[str, list[ResidueDefinition]],
+    ) -> Iterator[list[ResidueMatch]]:
+        for res_atom_idcs in self.residue_indices:
+            prototype_index = res_atom_idcs[0]
+            res_name = self.res_name[prototype_index]
+
+            print("matching new residue", res_name)
+
+            matches = []
+            for residue_definition in residue_database.get(res_name, []):
+                match = self.subset_matches_residue(
+                    res_atom_idcs,
+                    residue_definition,
+                )
+
+                if match is not None:
+                    matches.append(match)
+            yield matches
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
         return {
             field.name: getattr(self, field.name)[index]
             for field in dataclasses.fields(self)
@@ -266,28 +288,7 @@ class PdbData:
             )
             return None
 
-    def get_residue_matches(
-        self,
-        residue_database: Mapping[str, list[ResidueDefinition]],
-    ) -> Iterator[list[ResidueMatch]]:
-        for res_atom_idcs in self.residues():
-            prototype_index = res_atom_idcs[0]
-            res_name = self.res_name[prototype_index]
-
-            print("matching new residue", res_name)
-
-            matches = []
-            for residue_definition in residue_database.get(res_name, []):
-                match = self.subset_matches_residue(
-                    res_atom_idcs,
-                    residue_definition,
-                )
-
-                if match is not None:
-                    matches.append(match)
-            yield matches
-
-    def are_alt_locs(self, i: int, j: int):
+    def are_alt_locs(self, i: int, j: int) -> bool:
         if i == j:
             raise ValueError(f"i and j are the same ({i})")
         if max(i, j) - min(i, j) == 1:

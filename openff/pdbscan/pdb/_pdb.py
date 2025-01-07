@@ -111,7 +111,7 @@ __all__ = [
 
 
 def topology_from_pdb(
-    path: PathLike,
+    path: PathLike[str],
     use_canonical_names: bool = False,
     residue_database: Mapping[
         str, list[ResidueDefinition]
@@ -213,9 +213,9 @@ def topology_from_pdb(
     # TODO: Refactor into loop over with_neighbours(data.residues()) by combining matching logic
     for _, this_matches, next_matches in with_neighbours(
         data.get_residue_matches(residue_database),
-        [],
+        default=[],
     ):
-        this_filtered_matches = []
+        this_filtered_matches: list[ResidueMatch] = []
         for match in this_matches:
             # TODO: Simplify this and factor out into function with logic in PdbData.subset_matches_residue
             if len(match.missing_atoms) != 0:
@@ -248,24 +248,14 @@ def topology_from_pdb(
     # Now, we convert to OpenFF molecules
     molecules: list[Molecule] = []
     this_molecule = Molecule()
-    pdb_index_to_molecule_index = {}
     prev_chain_id = data.chain_id[0]
     prev_model = data.model[0]
-    conformer: list[tuple[float, float, float] | None] = []
-    for res_atom_idcs, residue_match in zip(data.residues(), matched_residues):
+    conformer: list[tuple[float, float, float]] = []
+    for res_atom_idcs, residue_match in zip(data.residue_indices, matched_residues):
         # this is a debug assert, if it triggers there's a bug
         assert set(res_atom_idcs) == residue_match.res_atom_idcs
 
         prototype_index = res_atom_idcs[0]
-
-        res_seq = data.res_seq[prototype_index]
-        residue_wide_metadata = {
-            "residue_name": data.res_name[prototype_index],
-            "res_seq": res_seq,
-            "residue_number": str(res_seq),
-            "insertion_code": data.i_code[prototype_index],
-            "chain_id": data.chain_id[prototype_index],
-        }
 
         # Terminate the previous molecule and start a new one if we can see that
         # this is the start of a new molecule
@@ -275,54 +265,20 @@ def topology_from_pdb(
             or not residue_match.expect_prior_bond
         ):
             this_molecule._invalidate_cached_properties()
+            this_molecule.add_conformer(conformer)
             molecules.append(this_molecule)
             this_molecule = Molecule()
+            conformer = []
 
-        # Add the residue to the current molecule
-        # TODO: Break this into a function
-        for pdb_index in res_atom_idcs:
-            atom_def = residue_match.atom(pdb_index)
-
-            if data.alt_loc[pdb_index] != "":
-                # TODO: Support altlocs (probably in PdbData, maybe PdbData.residues()?)
-                raise ValueError("altloc not yet supported")
-
-            xyz = (data.x[pdb_index], data.y[pdb_index], data.z[pdb_index])
-            conformer.append(xyz)
-
-            pdb_index_to_molecule_index[pdb_index] = this_molecule._add_atom(
-                atomic_number=elements.NUMBERS[atom_def.symbol],
-                formal_charge=atom_def.charge,
-                is_aromatic=atom_def.aromatic,
-                stereochemistry=atom_def.stereo,
-                name=atom_def.name if use_canonical_names else data.name[pdb_index],
-                metadata={
-                    **residue_wide_metadata,
-                    "pdb_index": pdb_index,
-                    "used_synonym": data.name[pdb_index],
-                    "canonical_name": atom_def.name,
-                    "atom_serial": data.serial[pdb_index],
-                    "matched_residue_description": residue_match.residue_definition.description,
-                    "b_factor": data.temp_factor[pdb_index],
-                    "occupancy": data.occupancy[pdb_index],
-                },
-                invalidate_cache=False,
-            )
-
-        for bond in residue_match.residue_definition.bonds:
-            this_molecule._add_bond(
-                atom1=residue_match.atom(bond.atom1),
-                atom2=residue_match.atom(bond.atom2),
-                bond_order=bond.order,
-                is_aromatic=bond.aromatic,
-                stereochemistry=None,  # TODO: Calculate stereo from coords
-                invalidate_cache=False,
-            )
+        add_to_molecule(this_molecule, conformer, res_atom_idcs, residue_match, data)
 
         # Terminate the current molecule if we can see that this is the last residue
         if data.terminated[prototype_index] or not residue_match.expect_posterior_bond:
+            this_molecule._invalidate_cached_properties()
+            this_molecule.add_conformer(conformer)
             molecules.append(this_molecule)
             this_molecule = Molecule()
+            conformer = []
 
         # TODO: Load other data from PDB file
         # TODO: Incorporate CONECT records
@@ -355,3 +311,57 @@ def topology_from_pdb(
         )
 
     return topology
+
+
+def add_to_molecule(
+    this_molecule: Molecule,
+    conformer: list[tuple[float, float, float]],
+    pdb_index_to_molecule_index: dict[int, int],
+    res_atom_idcs: list[int],
+    residue_match: ResidueMatch,
+    data: PdbData,
+) -> None:
+    # Add the residue to the current molecule
+    for pdb_index in res_atom_idcs:
+        atom_def = residue_match.atom(pdb_index)
+
+        if data.alt_loc[pdb_index] != "":
+            # TODO: Support altlocs (probably in PdbData, maybe PdbData.residues()?)
+            raise ValueError("altloc not yet supported")
+
+        xyz = (data.x[pdb_index], data.y[pdb_index], data.z[pdb_index])
+        conformer.append(xyz)
+
+        pdb_index_to_molecule_index[pdb_index] = this_molecule._add_atom(
+            atomic_number=elements.NUMBERS[atom_def.symbol],
+            formal_charge=atom_def.charge,
+            is_aromatic=atom_def.aromatic,
+            stereochemistry=atom_def.stereo,
+            name=atom_def.name if use_canonical_names else data.name[pdb_index],
+            metadata={
+                "residue_name": data.res_name[pdb_index],
+                "res_seq": data.res_seq[pdb_index],
+                "residue_number": str(data.res_seq[pdb_index]),
+                "insertion_code": data.i_code[pdb_index],
+                "chain_id": data.chain_id[pdb_index],
+                "pdb_index": pdb_index,
+                "used_synonym": data.name[pdb_index],
+                "canonical_name": atom_def.name,
+                "atom_serial": data.serial[pdb_index],
+                "matched_residue_description": residue_match.residue_definition.description,
+                "b_factor": data.temp_factor[pdb_index],
+                "occupancy": data.occupancy[pdb_index],
+            },
+            invalidate_cache=False,
+        )
+
+    for bond in residue_match.residue_definition.bonds:
+        this_molecule._add_bond(
+            # TODO: Fix
+            atom1=residue_match.atom(bond.atom1),
+            atom2=residue_match.atom(bond.atom2),
+            bond_order=bond.order,
+            is_aromatic=bond.aromatic,
+            stereochemistry=None,  # TODO: Calculate stereo from coords
+            invalidate_cache=False,
+        )

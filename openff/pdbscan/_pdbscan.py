@@ -1,4 +1,5 @@
 import multiprocessing
+from itertools import islice
 from os import PathLike, cpu_count
 from pathlib import Path
 from typing import Callable, Iterable
