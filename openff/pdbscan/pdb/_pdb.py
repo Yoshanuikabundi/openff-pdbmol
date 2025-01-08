@@ -27,7 +27,6 @@ __all__ = [
 def _load_unknown_residue(
     data: PdbData, indices: tuple[int, ...], unknown_molecules: Sequence[Molecule]
 ) -> Molecule | None:
-    print(f"Consulting {unknown_molecules=}")
     conects = set()
     serial_to_mol_index = {}
     pdbmol = Molecule()
@@ -72,7 +71,6 @@ def _load_unknown_residue(
             bond_stereochemistry_matching=False,
             strip_pyrimidal_n_atom_stereo=True,
         )
-        print(f"{match_found=} {mapping=} {molecule=} {pdbmol=}")
         if match_found:
             assert mapping is not None
             molecule = Molecule(molecule)
@@ -190,7 +188,6 @@ def topology_from_pdb(
     this_molecule = Molecule()
     prev_chain_id = data.chain_id[0]
     prev_model = data.model[0]
-    conformer: list[tuple[float, float, float]] = []
     for res_atom_idcs, matches in zip(
         data.residue_indices, data.get_residue_matches(residue_database)
     ):
@@ -208,8 +205,6 @@ def topology_from_pdb(
         # If all matches would assign the same chemistry, accept it
         # assert all([]) == True
         elif all(a.agrees_with(b) for a, b in itertools.pairwise(matches)):
-            if len(matches) > 1:
-                print("Multiple filtered matches, but they are all equivalent")
             chemical_data = matches[0]
 
             # this is a debug assert, if it triggers there's a bug
@@ -230,13 +225,8 @@ def topology_from_pdb(
             )
             or (isinstance(chemical_data, Molecule))
         ):
-            this_molecule._invalidate_cached_properties()
-            this_molecule.add_conformer(np.asarray(conformer) * unit.nanometer)
             molecules.append(this_molecule)
             this_molecule = Molecule()
-            conformer = []
-
-        conformer.extend((data.x[i], data.y[i], data.z[i]) for i in res_atom_idcs)
 
         # Apply the chemical data we've collected
         if isinstance(chemical_data, Molecule):
@@ -261,11 +251,8 @@ def topology_from_pdb(
                 and not chemical_data.expect_posterior_bond
             )
         ):
-            this_molecule._invalidate_cached_properties()
-            this_molecule.add_conformer(np.asarray(conformer) * unit.nanometer)
             molecules.append(this_molecule)
             this_molecule = Molecule()
-            conformer = []
 
         # TODO: Load other data from PDB file
         # TODO: Incorporate CONECT records
@@ -279,7 +266,9 @@ def topology_from_pdb(
         offmol.add_default_hierarchy_schemes()
     molecules.append(this_molecule)
 
-    topology = Topology.from_molecules(molecules)  # type: ignore[call-arg]
+    topology = Topology.from_molecules(molecules)
+    topology.set_positions(np.stack([data.x, data.y, data.z], axis=-1) * unit.angstrom)
+
     if (
         data.cryst1_a is not None
         and data.cryst1_b is not None

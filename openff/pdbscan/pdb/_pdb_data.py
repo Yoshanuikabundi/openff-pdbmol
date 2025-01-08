@@ -255,13 +255,6 @@ class PdbData:
             prototype_index = res_atom_idcs[0]
             res_name = self.res_name[prototype_index]
 
-            print(
-                "\nmatching new residue",
-                self.chain_id[prototype_index],
-                res_name,
-                self.res_seq[prototype_index],
-            )
-
             matches: list[ResidueMatch] = []
             for residue_definition in residue_database.get(res_name, []):
                 match = self.subset_matches_residue(
@@ -269,11 +262,7 @@ class PdbData:
                     residue_definition,
                 )
 
-                print(f"    {residue_definition.description}")
                 if match is not None:
-                    print(
-                        f"    {match.expect_prior_bond=} {match.expect_posterior_bond=}"
-                    )
                     matches.append(match)
 
             if len(matches) == 0:
@@ -281,7 +270,6 @@ class PdbData:
                 # raise NoMatchingResidueDefinitionError(res_atom_idcs, self)
                 pass
 
-            print(len(matches))
             all_matches.append(tuple(matches))
 
         prev_filtered_matches: list[ResidueMatch] = []
@@ -306,32 +294,13 @@ class PdbData:
                 )
                 or len(prev_filtered_matches) == 0
             )
-            print(
-                "\nchecking bonds for residue",
-                f"{len(this_matches)} matches before filtering",
-                f"{neighbours_support_posterior_bond=}",
-                f"{neighbours_support_prior_bond=}",
-                f"{neighbours_support_molecule_end=}",
-                f"{neighbours_support_molecule_start=}",
-                sep="\n",
-            )
             this_filtered_matches: list[ResidueMatch] = []
             for match in this_matches:
-                print(
-                    self.chain_id[match.prototype_index],
-                    match.residue_definition.residue_name,
-                    self.res_seq[match.prototype_index],
-                    f"{match.expect_prior_bond=}",
-                    f"{match.expect_posterior_bond=}",
-                    f"{match.residue_definition.description=}",
-                    end=" ",
-                )
                 if len(match.missing_atoms) != 0:
                     prior_bond_mismatched = (
                         match.expect_prior_bond != neighbours_support_prior_bond
                     )
                     if prior_bond_mismatched:
-                        print("match filtered out because of prior bond mismatch")
                         continue
 
                     # assert any([]) == False
@@ -339,29 +308,15 @@ class PdbData:
                         match.expect_posterior_bond != neighbours_support_posterior_bond
                     )
                     if posterior_bond_mismatched:
-                        print("match filtered out because of posterior bond mismatch")
                         continue
 
-                    print("match's bonds are happy!")
                     this_filtered_matches.append(match)
                 elif (
                     neighbours_support_molecule_end
                     and neighbours_support_molecule_start
                 ):
-                    print("match expects no bonds, and neighbours are happy with that!")
                     this_filtered_matches.append(match)
 
-            if len(this_filtered_matches) != 0:
-                print(
-                    f"\n{len(this_filtered_matches)} matches after filtering",
-                    *[
-                        f"i:  {this_filtered_matches[i].residue_definition.description}\n    {this_filtered_matches[i].expect_prior_bond=}\n    {this_filtered_matches[i].expect_posterior_bond=},  "
-                        for i in range(len(this_filtered_matches))
-                    ],
-                    sep="\n",
-                )
-            else:
-                print("all matches filtered out")
             yield this_filtered_matches
 
             prev_filtered_matches = this_filtered_matches
@@ -384,14 +339,12 @@ class PdbData:
 
         # Skip definitions with too few atoms
         if len(residue_definition.atoms) < len(res_atom_idcs):
-            print("res def has too few atoms")
             return None
 
         # Skip non-linking definitions with the wrong number of atoms
         if residue_definition.linking_bond is None and len(
             residue_definition.atoms
         ) != len(res_atom_idcs):
-            print("nonlinking res def has wrong number of atoms")
             return None
 
         # Get the map from the canonical names to the indices
@@ -400,21 +353,12 @@ class PdbData:
                 i: residue_definition.name_to_atom[self.name[i]] for i in res_atom_idcs
             }
         except KeyError as e:
-            print(
-                "name in pdb file missing from res def:",
-                e,
-                # {
-                #     name: atom.name
-                #     for name, atom in residue_definition.name_to_atom.items()
-                # },
-            )
             return None
 
         matched_atoms = set(atom.name for atom in index_to_atomdef.values())
 
         # Fail to match if any atoms in PDB file got matched to more than one name
         if len(matched_atoms) != len(res_atom_idcs):
-            print("name in pdb file with multiple matches in res def")
             return None
 
         # This assert should be guaranteed by the above
@@ -430,13 +374,6 @@ class PdbData:
         # - the posterior bond leaving fragment
         # - both leaving fragments
         if any(not atom.leaving for atom in missing_atoms):
-            print(
-                "missing atom is not leaving:",
-                [
-                    f"{atom.name} (aka {', '.join(atom.synonyms)}) {atom.leaving=}"
-                    for atom in missing_atoms
-                ],
-            )
             return None
         elif set(atom.name for atom in missing_atoms) in [
             set(),
@@ -446,14 +383,12 @@ class PdbData:
             residue_definition.prior_bond_leaving_atoms,
             residue_definition.posterior_bond_leaving_atoms,
         ]:
-            print(f"matched! {len(missing_atoms)=}")
             return ResidueMatch(
                 index_to_atomdef=index_to_atomdef,
                 residue_definition=residue_definition,
                 missing_atoms={atom.name for atom in missing_atoms},
             )
         else:
-            print("missing atoms do not belong to one linking bond, the other, or both")
             return None
 
     def are_alt_locs(self, i: int, j: int) -> bool:

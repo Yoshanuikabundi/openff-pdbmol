@@ -4,7 +4,6 @@ Tools for reading and patching the PDB Chemical Component Dictionary (CCD).
 
 import dataclasses
 import gzip
-import pprint
 from copy import deepcopy
 from io import StringIO
 from pathlib import Path
@@ -177,30 +176,12 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
             )
 
             # Identify the linking embedded fragments and put the leaving atoms back in
-            # print(
-            #     f"{child_def=}",
-            #     f"{child_bonds.issubset(parent_bonds)=}",
-            #     f"{child_atoms.issubset(parent_atoms)=}",
-            #     f"{child_atoms.isdisjoint(parent_leaver_names)=}",
-            #     f"{'LINKING EMBEDDED FRAGMENT' in child_def.description=}",
-            #     f"{child_atoms.difference(parent_leaver_names)=}",
-            #     f"{parent_leaver_names.difference(child_atoms)=}",
-            #     sep="\n",
-            # )
             if (
                 child_bonds.issubset(parent_bonds)
                 and child_atoms.issubset(parent_atoms)
                 and child_atoms.isdisjoint(parent_leaver_names)
                 and "LINKING EMBEDDED FRAGMENT" in child_def.description
             ):
-                # print(True)
-                # print(
-                #     f"{parent_leaver_bonds=}",
-                #     f"{child_def.bonds=}",
-                #     f"{tuple(parent_leaver_bonds.union(child_def.bonds))}",
-                #     sep="\n",
-                #     end="\n\n",
-                # )
                 linking_atoms = (
                     []
                     if child_def.linking_bond is None
@@ -223,9 +204,7 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
                     bonds=tuple(parent_leaver_bonds.union(child_def.bonds)),
                 )
                 self._add_definition(new_def)
-                # pprint.pprint(new_def)
             else:
-                # print(False)
                 self._add_definition(
                     dataclasses.replace(
                         child_def,
