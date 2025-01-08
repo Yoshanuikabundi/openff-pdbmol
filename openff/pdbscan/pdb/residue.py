@@ -3,8 +3,8 @@ Classes for defining custom residues.
 """
 
 from copy import deepcopy
-from dataclasses import dataclass
-from functools import cached_property, lru_cache
+from dataclasses import InitVar, dataclass
+from functools import cached_property
 from typing import (
     Collection,
     Iterator,
@@ -30,7 +30,7 @@ class AtomDefinition:
     """
 
     name: str
-    synonyms: set[str]
+    synonyms: tuple[str, ...]
     symbol: str
     leaving: bool
     charge: int
@@ -58,18 +58,39 @@ class ResidueDefinition:
     """
 
     residue_name: str
+    parent_residue_name: str | None
     description: str
     linking_bond: BondDefinition | None
     atoms: tuple[AtomDefinition, ...]
     bonds: tuple[BondDefinition, ...]
+    _skip_post_init_validation: InitVar[bool] = False
 
-    def __post_init__(self):
+    def __post_init__(self, _skip_post_init_validation: bool):
+        if _skip_post_init_validation:
+            return
+
+        self._validate()
+
+    def _validate(self):
         if self.linking_bond is None and True in {atom.leaving for atom in self.atoms}:
             raise ValueError(
-                "Leaving atoms were specified, but there is no linking bond"
+                f"{self.residue_name}: Leaving atoms were specified, but there is no linking bond",
+                self,
             )
         if len(set(atom.name for atom in self.atoms)) != len(self.atoms):
-            raise ValueError("All atoms must have unique canonical names")
+            raise ValueError(
+                f"{self.residue_name}: All atoms must have unique canonical names"
+            )
+
+        all_leaving_atoms = {atom.name for atom in self.atoms if atom.leaving}
+        assigned_leaving_atoms = self.prior_bond_leaving_atoms.union(
+            self.posterior_bond_leaving_atoms
+        )
+        unassigned_leaving_atoms = all_leaving_atoms.difference(assigned_leaving_atoms)
+        if len(unassigned_leaving_atoms) != 0:
+            raise ValueError(
+                f"{self.residue_name}: Leaving atoms could not be assigned to a bond: {unassigned_leaving_atoms}"
+            )
 
     @classmethod
     def from_molecule(
@@ -78,13 +99,14 @@ class ResidueDefinition:
         molecule: Molecule,
         linking_bond: BondDefinition | None = None,
         description: str = "",
+        parent_residue_name: str | None = None,
     ) -> Self:
         atoms: list[AtomDefinition] = []
         for i, atom in enumerate(molecule.atoms):
             atoms.append(
                 AtomDefinition(
                     name=atom.name,
-                    synonyms=set(),
+                    synonyms=(),
                     symbol=atom.symbol,
                     leaving=bool(atom.metadata.get("leaving_atom")),
                     charge=atom.formal_charge,
@@ -106,6 +128,7 @@ class ResidueDefinition:
 
         return cls(
             residue_name=name,
+            parent_residue_name=parent_residue_name,
             description=description,
             linking_bond=linking_bond,
             atoms=tuple(atoms),
@@ -209,10 +232,52 @@ class ResidueDefinition:
                 mapping[synonym] = atom
         return mapping
 
-    @lru_cache
     def atoms_bonded_to(self, atom_name: str) -> Iterator[str]:
         for bond in self.bonds:
             if bond.atom1 == atom_name:
                 yield bond.atom2
             if bond.atom2 == atom_name:
                 yield bond.atom1
+
+    def _leaving_fragment_of(self, linking_atom: str) -> Iterator[str]:
+        atoms_to_check = list(self.atoms_bonded_to(linking_atom))
+        checked_atoms: set[str] = set()
+        while atoms_to_check:
+            atom_name = atoms_to_check.pop()
+            if self.name_to_atom[atom_name].leaving:
+                yield atom_name
+                atoms_to_check.extend(
+                    filter(
+                        lambda x: x not in checked_atoms,
+                        self.atoms_bonded_to(atom_name),
+                    )
+                )
+            checked_atoms.add(atom_name)
+
+    @cached_property
+    def posterior_bond_leaving_atoms(self) -> set[str]:
+        return (
+            set()
+            if self.linking_bond is None
+            else set(self._leaving_fragment_of(self.posterior_bond_linking_atom))
+        )
+
+    @cached_property
+    def prior_bond_leaving_atoms(self) -> set[str]:
+        return (
+            set()
+            if self.linking_bond is None
+            else set(self._leaving_fragment_of(self.prior_bond_linking_atom))
+        )
+
+    @property
+    def prior_bond_linking_atom(self) -> str:
+        if self.linking_bond is None:
+            raise ValueError("not a linking residue")
+        return self.linking_bond.atom2
+
+    @property
+    def posterior_bond_linking_atom(self) -> str:
+        if self.linking_bond is None:
+            raise ValueError("not a linking residue")
+        return self.linking_bond.atom1

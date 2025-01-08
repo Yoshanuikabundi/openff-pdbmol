@@ -1,9 +1,10 @@
 import dataclasses
 from dataclasses import dataclass, field
 from functools import cached_property
+from symtable import Symbol
 from typing import Any, Iterable, Iterator, Mapping, Self, Sequence
 
-from ._utils import __UNSET__, dec_hex
+from ._utils import __UNSET__, dec_hex, with_neighbours
 from .residue import AtomDefinition, ResidueDefinition
 
 
@@ -26,6 +27,10 @@ class ResidueMatch:
         return set(self.index_to_atomdef)
 
     @cached_property
+    def prototype_index(self) -> int:
+        return next(iter(self.index_to_atomdef))
+
+    @cached_property
     def missing_leaving_atoms(self) -> set[str]:
         return {
             atom_name
@@ -34,18 +39,22 @@ class ResidueMatch:
         }
 
     @cached_property
+    def matched_canonical_atom_names(self) -> set[str]:
+        return {atom.name for atom in self.index_to_atomdef.values()}
+
+    @cached_property
     def expect_prior_bond(self) -> bool:
         if self.residue_definition.linking_bond is None:
             return False
 
-        linking_atom = self.residue_definition.linking_bond.atom2
-        print(f"{linking_atom=}")
-        bonded_to_linking_atom = self.residue_definition.atoms_bonded_to(linking_atom)
-        print(f"{linking_atom=}, {bonded_to_linking_atom=}")
+        linking_atom = self.residue_definition.prior_bond_linking_atom
+        expected_leaving_atoms = self.residue_definition.prior_bond_leaving_atoms
 
-        # TODO: Check all leaving atoms for the prior bond
-        return any(
-            atom in self.missing_leaving_atoms for atom in bonded_to_linking_atom
+        return (
+            linking_atom in self.matched_canonical_atom_names
+            and len(expected_leaving_atoms) > 0
+            and self.missing_leaving_atoms.intersection(expected_leaving_atoms)
+            == expected_leaving_atoms
         )
 
     @cached_property
@@ -53,13 +62,56 @@ class ResidueMatch:
         if self.residue_definition.linking_bond is None:
             return False
 
-        linking_atom = self.residue_definition.linking_bond.atom1
+        linking_atom = self.residue_definition.posterior_bond_linking_atom
+        expected_leaving_atoms = self.residue_definition.posterior_bond_leaving_atoms
 
-        # TODO: Check all leaving atoms for the posterior bond
-        return any(
-            atom in self.missing_leaving_atoms
-            for atom in self.residue_definition.atoms_bonded_to(linking_atom)
+        return (
+            linking_atom in self.matched_canonical_atom_names
+            and len(expected_leaving_atoms) > 0
+            and self.missing_leaving_atoms.intersection(expected_leaving_atoms)
+            == expected_leaving_atoms
         )
+
+    def agrees_with(self, other: Self) -> bool:
+        """True if both matches would assign the same chemistry, False otherwise"""
+        if set(self.index_to_atomdef.keys()) != set(other.index_to_atomdef.keys()):
+            return False
+
+        name_map: dict[str, str] = {}
+        for i, self_atom in self.index_to_atomdef.items():
+            other_atom = other.index_to_atomdef[i]
+            if not (
+                self_atom.aromatic == other_atom.aromatic
+                and self_atom.charge == other_atom.charge
+                and self_atom.symbol == other_atom.symbol
+                and self_atom.stereo == other_atom.stereo
+            ):
+                return False
+            name_map[self_atom.name] = other_atom.name
+
+        self_bonds = {
+            (
+                *sorted([name_map[bond.atom1], name_map[bond.atom2]]),
+                bond.aromatic,
+                bond.order,
+                bond.stereo,
+            )
+            for bond in self.residue_definition.bonds
+            if bond.atom1 in self.matched_canonical_atom_names
+            and bond.atom2 in self.matched_canonical_atom_names
+        }
+        other_bonds = {
+            (
+                *sorted([bond.atom1, bond.atom2]),
+                bond.aromatic,
+                bond.order,
+                bond.stereo,
+            )
+            for bond in other.residue_definition.bonds
+            if bond.atom1 in self.matched_canonical_atom_names
+            and bond.atom2 in self.matched_canonical_atom_names
+        }
+        return self_bonds == other_bonds
 
 
 @dataclass
@@ -198,22 +250,121 @@ class PdbData:
         self,
         residue_database: Mapping[str, list[ResidueDefinition]],
     ) -> Iterator[list[ResidueMatch]]:
+        all_matches: list[tuple[ResidueMatch, ...]] = []
         for res_atom_idcs in self.residue_indices:
             prototype_index = res_atom_idcs[0]
             res_name = self.res_name[prototype_index]
 
-            print("matching new residue", res_name)
+            print(
+                "\nmatching new residue",
+                self.chain_id[prototype_index],
+                res_name,
+                self.res_seq[prototype_index],
+            )
 
-            matches = []
+            matches: list[ResidueMatch] = []
             for residue_definition in residue_database.get(res_name, []):
                 match = self.subset_matches_residue(
                     res_atom_idcs,
                     residue_definition,
                 )
 
+                print(f"    {residue_definition.description}")
                 if match is not None:
+                    print(
+                        f"    {match.expect_prior_bond=} {match.expect_posterior_bond=}"
+                    )
                     matches.append(match)
-            yield matches
+
+            if len(matches) == 0:
+                # TODO: Implement additional_substructures here
+                # raise NoMatchingResidueDefinitionError(res_atom_idcs, self)
+                pass
+
+            print(len(matches))
+            all_matches.append(tuple(matches))
+
+        prev_filtered_matches: list[ResidueMatch] = []
+        for _, this_matches, next_matches in with_neighbours(
+            all_matches,
+            default=(),
+        ):
+            neighbours_support_posterior_bond = any(
+                next_match.expect_prior_bond for next_match in next_matches
+            )
+            neighbours_support_prior_bond = any(
+                prev_match.expect_posterior_bond for prev_match in prev_filtered_matches
+            )
+            neighbours_support_molecule_end = (
+                any(not next_match.expect_prior_bond for next_match in next_matches)
+                or len(next_matches) == 0
+            )
+            neighbours_support_molecule_start = (
+                any(
+                    not prev_match.expect_posterior_bond
+                    for prev_match in prev_filtered_matches
+                )
+                or len(prev_filtered_matches) == 0
+            )
+            print(
+                "\nchecking bonds for residue",
+                f"{len(this_matches)} matches before filtering",
+                f"{neighbours_support_posterior_bond=}",
+                f"{neighbours_support_prior_bond=}",
+                f"{neighbours_support_molecule_end=}",
+                f"{neighbours_support_molecule_start=}",
+                sep="\n",
+            )
+            this_filtered_matches: list[ResidueMatch] = []
+            for match in this_matches:
+                print(
+                    self.chain_id[match.prototype_index],
+                    match.residue_definition.residue_name,
+                    self.res_seq[match.prototype_index],
+                    f"{match.expect_prior_bond=}",
+                    f"{match.expect_posterior_bond=}",
+                    f"{match.residue_definition.description=}",
+                    end=" ",
+                )
+                if len(match.missing_atoms) != 0:
+                    prior_bond_mismatched = (
+                        match.expect_prior_bond != neighbours_support_prior_bond
+                    )
+                    if prior_bond_mismatched:
+                        print("match filtered out because of prior bond mismatch")
+                        continue
+
+                    # assert any([]) == False
+                    posterior_bond_mismatched = (
+                        match.expect_posterior_bond != neighbours_support_posterior_bond
+                    )
+                    if posterior_bond_mismatched:
+                        print("match filtered out because of posterior bond mismatch")
+                        continue
+
+                    print("match's bonds are happy!")
+                    this_filtered_matches.append(match)
+                elif (
+                    neighbours_support_molecule_end
+                    and neighbours_support_molecule_start
+                ):
+                    print("match expects no bonds, and neighbours are happy with that!")
+                    this_filtered_matches.append(match)
+
+            if len(this_filtered_matches) != 0:
+                print(
+                    f"\n{len(this_filtered_matches)} matches after filtering",
+                    *[
+                        f"i:  {this_filtered_matches[i].residue_definition.description}\n    {this_filtered_matches[i].expect_prior_bond=}\n    {this_filtered_matches[i].expect_posterior_bond=},  "
+                        for i in range(len(this_filtered_matches))
+                    ],
+                    sep="\n",
+                )
+            else:
+                print("all matches filtered out")
+            yield this_filtered_matches
+
+            prev_filtered_matches = this_filtered_matches
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         return {
@@ -250,12 +401,12 @@ class PdbData:
             }
         except KeyError as e:
             print(
-                "name in pdb file missing from res def 1:",
+                "name in pdb file missing from res def:",
                 e,
-                {
-                    name: atom.name
-                    for name, atom in residue_definition.name_to_atom.items()
-                },
+                # {
+                #     name: atom.name
+                #     for name, atom in residue_definition.name_to_atom.items()
+                # },
             )
             return None
 
@@ -273,19 +424,36 @@ class PdbData:
             atom for atom in residue_definition.atoms if atom.name not in matched_atoms
         ]
 
-        # Match only if all atoms missing from the PDB file are leaving atoms
-        if all(atom.leaving for atom in missing_atoms):
-            print("matched!")
+        # Match only if the set of all missing atoms is one of the following:
+        # - empty
+        # - the prior bond leaving fragment
+        # - the posterior bond leaving fragment
+        # - both leaving fragments
+        if any(not atom.leaving for atom in missing_atoms):
+            print(
+                "missing atom is not leaving:",
+                [
+                    f"{atom.name} (aka {', '.join(atom.synonyms)}) {atom.leaving=}"
+                    for atom in missing_atoms
+                ],
+            )
+            return None
+        elif set(atom.name for atom in missing_atoms) in [
+            set(),
+            residue_definition.prior_bond_leaving_atoms.union(
+                residue_definition.posterior_bond_leaving_atoms
+            ),
+            residue_definition.prior_bond_leaving_atoms,
+            residue_definition.posterior_bond_leaving_atoms,
+        ]:
+            print(f"matched! {len(missing_atoms)=}")
             return ResidueMatch(
                 index_to_atomdef=index_to_atomdef,
                 residue_definition=residue_definition,
                 missing_atoms={atom.name for atom in missing_atoms},
             )
         else:
-            print(
-                "missing atom is not leaving:",
-                [(atom.name, atom.synonyms, atom.leaving) for atom in missing_atoms],
-            )
+            print("missing atoms do not belong to one linking bond, the other, or both")
             return None
 
     def are_alt_locs(self, i: int, j: int) -> bool:

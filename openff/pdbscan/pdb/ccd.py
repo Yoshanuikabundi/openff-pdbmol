@@ -4,6 +4,7 @@ Tools for reading and patching the PDB Chemical Component Dictionary (CCD).
 
 import dataclasses
 import gzip
+import pprint
 from copy import deepcopy
 from io import StringIO
 from pathlib import Path
@@ -98,11 +99,22 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         # Get the patches for this definition, or the identity function if absent
         patch_res = self._patches.get(definition.residue_name.upper(), lambda x: [x])
         patch_all = self._patches.get("*", lambda x: [x])
+
         # Apply the patches and flatten as appropriate
-        return list(flatten(patch_res(res) for res in patch_all(definition)))
+        ret: list[ResidueDefinition] = []
+        for res in patch_all(definition):
+            for patched in patch_res(res):
+                patched._validate()
+                ret.append(patched)
+        return ret
 
     def _add_definition_from_str(self, s: str, res_name: str | None = None) -> None:
         definition = self._res_def_from_ccd_str(s)
+        self._add_definition(definition, res_name)
+
+    def _add_definition(
+        self, definition: ResidueDefinition, res_name: str | None = None
+    ) -> None:
         if res_name is None:
             res_name = definition.residue_name.upper()
 
@@ -116,21 +128,110 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         self._definitions.setdefault(res_name, []).extend(patched_definitions)
 
     def _load_protonation_variants(self):
-        path = self._path / "aa-variants-v1.cif.gz"
+        path = self._path / "aa-variants-v1.cif"
         if not path.exists():
             with urlopen(
                 "https://files.wwpdb.org/pub/pdb/data/monomers/aa-variants-v1.cif.gz",
             ) as stream:
                 b = stream.read()
-            path.write_bytes(b)
-
-        with gzip.open(path) as f:
-            s = f.read().decode("utf-8")
+            s = gzip.decompress(b).decode("utf-8")
+            path.write_text(s)
+        else:
+            s = path.read_text()
 
         assert s.startswith("data_")
+        parent_definitions: dict[str, ResidueDefinition] = {}
+        child_definitions: list[ResidueDefinition] = []
         for block in s[5:].split("\ndata_"):
             block = "data_" + block
-            self._add_definition_from_str("data_" + block)
+            res_def = self._res_def_from_ccd_str("data_" + block)
+            if res_def.parent_residue_name is None:
+                # Add the definitions of the fully protonated residue
+                parent_definitions[res_def.residue_name] = res_def
+                self._add_definition(res_def)
+            else:
+                child_definitions.append(res_def)
+
+        for child_def in child_definitions:
+            if "SIDE CHAIN RESONANCE ALTERNATE" in child_def.description:
+                continue
+            assert child_def.parent_residue_name is not None
+            parent_def = parent_definitions[child_def.parent_residue_name]
+
+            child_bonds = set(
+                tuple(sorted([bond.atom1, bond.atom2])) for bond in child_def.bonds
+            )
+            child_atoms = set(atom.name for atom in child_def.atoms)
+            parent_bonds = set(
+                tuple(sorted([bond.atom1, bond.atom2])) for bond in parent_def.bonds
+            )
+            parent_atoms = set(atom.name for atom in parent_def.atoms)
+            parent_leaver_names = set(
+                atom.name for atom in parent_def.atoms if atom.leaving
+            )
+            parent_leaver_bonds = set(
+                bond
+                for bond in parent_def.bonds
+                if bond.atom1 in parent_leaver_names
+                or bond.atom2 in parent_leaver_names
+            )
+
+            # Identify the linking embedded fragments and put the leaving atoms back in
+            # print(
+            #     f"{child_def=}",
+            #     f"{child_bonds.issubset(parent_bonds)=}",
+            #     f"{child_atoms.issubset(parent_atoms)=}",
+            #     f"{child_atoms.isdisjoint(parent_leaver_names)=}",
+            #     f"{'LINKING EMBEDDED FRAGMENT' in child_def.description=}",
+            #     f"{child_atoms.difference(parent_leaver_names)=}",
+            #     f"{parent_leaver_names.difference(child_atoms)=}",
+            #     sep="\n",
+            # )
+            if (
+                child_bonds.issubset(parent_bonds)
+                and child_atoms.issubset(parent_atoms)
+                and child_atoms.isdisjoint(parent_leaver_names)
+                and "LINKING EMBEDDED FRAGMENT" in child_def.description
+            ):
+                # print(True)
+                # print(
+                #     f"{parent_leaver_bonds=}",
+                #     f"{child_def.bonds=}",
+                #     f"{tuple(parent_leaver_bonds.union(child_def.bonds))}",
+                #     sep="\n",
+                #     end="\n\n",
+                # )
+                linking_atoms = (
+                    []
+                    if child_def.linking_bond is None
+                    else [child_def.linking_bond.atom1, child_def.linking_bond.atom2]
+                )
+                new_def = dataclasses.replace(
+                    child_def,
+                    residue_name=parent_def.residue_name,
+                    atoms=tuple(
+                        [
+                            *filter(
+                                lambda x: x.name not in linking_atoms, child_def.atoms
+                            ),
+                            *filter(
+                                lambda x: x.name in linking_atoms, parent_def.atoms
+                            ),
+                            *filter(lambda x: x.leaving, parent_def.atoms),
+                        ]
+                    ),
+                    bonds=tuple(parent_leaver_bonds.union(child_def.bonds)),
+                )
+                self._add_definition(new_def)
+                # pprint.pprint(new_def)
+            else:
+                # print(False)
+                self._add_definition(
+                    dataclasses.replace(
+                        child_def,
+                        residue_name=parent_def.residue_name,
+                    )
+                )
 
     def _download_cif(self, resname: str) -> str:
         with urlopen(
@@ -149,11 +250,13 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
             PdbxReader(file).read(data)
         block = data[0]
 
-        residueName = (
+        parent_residue_name = (
             block.getObj("chem_comp").getValue("mon_nstd_parent_comp_id").upper()
         )
-        if residueName == "?":
-            residueName = block.getObj("chem_comp").getValue("id").upper()
+        parent_residue_name = (
+            None if parent_residue_name == "?" else parent_residue_name
+        )
+        residueName = block.getObj("chem_comp").getValue("id").upper()
         residue_description = block.getObj("chem_comp").getValue("name")
         linking_type = block.getObj("chem_comp").getValue("type").upper()
         linking_bond = LINKING_TYPES[linking_type]
@@ -170,7 +273,7 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
         atoms = [
             AtomDefinition(
                 name=row[atomNameCol],
-                synonyms=set(
+                synonyms=tuple(
                     [row[altAtomNameCol]]
                     if row[altAtomNameCol] != row[atomNameCol]
                     else []
@@ -206,10 +309,12 @@ class CcdCache(Mapping[str, list[ResidueDefinition]]):
 
         return ResidueDefinition(
             residue_name=residueName,
+            parent_residue_name=parent_residue_name,
             description=residue_description,
             linking_bond=linking_bond,
             atoms=tuple(atoms),
             bonds=tuple(bonds),
+            _skip_post_init_validation=True,
         )
 
     def __contains__(self, value: object) -> bool:
@@ -267,9 +372,23 @@ def add_synonyms(res: ResidueDefinition) -> list[ResidueDefinition]:
     """
     Patch a residue definition to include synonyms from :py:data:`ATOM_NAME_SYNONYMS`.
     """
-    for atom in res.atoms:
-        atom.synonyms.update(ATOM_NAME_SYNONYMS[res.residue_name].get(atom.name, []))
-    return [res]
+    return [
+        dataclasses.replace(
+            res,
+            atoms=tuple(
+                dataclasses.replace(
+                    atom,
+                    synonyms=tuple(
+                        {
+                            *atom.synonyms,
+                            *ATOM_NAME_SYNONYMS[res.residue_name].get(atom.name, []),
+                        }
+                    ),
+                )
+                for atom in res.atoms
+            ),
+        )
+    ]
 
 
 def disambiguate_alt_ids(res: ResidueDefinition) -> list[ResidueDefinition]:
@@ -389,7 +508,7 @@ LINKING_TYPES: dict[str, BondDefinition | None] = {
 
 # TODO: Replace these patches with CONECT records?
 CCD_RESIDUE_DEFINITION_CACHE = CcdCache(
-    Path(__file__).parent / "../../.ccd_cache",
+    Path(__file__).parent / "../../../.ccd_cache",
     patches=combine_patches(
         {"*": disambiguate_alt_ids},
         {
