@@ -2,6 +2,8 @@ from typing import Iterable, Iterator, TypeVar
 
 from pint import Quantity
 
+from openff.toolkit import Molecule
+from openff.toolkit.utils import UndefinedStereochemistryError
 from openff.units import unit
 
 __all__ = [
@@ -132,3 +134,26 @@ def cryst_to_box_vectors(
         openmm.unit.Quantity(gamma, openmm.unit.degree),
     )
     return box_vectors.value_in_unit(openmm_unit_nanometer) * unit.nanometer
+
+
+def assign_stereochemistry_from_3d(molecule: Molecule):
+    from rdkit.Chem import AssignStereochemistryFrom3D
+
+    # TODO: Assign bonds as well
+    rdmol = molecule.to_rdkit()
+    AssignStereochemistryFrom3D(rdmol, confId=0, replaceExistingTags=True)
+
+    for offatom, rdatom in zip(molecule.atoms, rdmol.GetAtoms()):
+        stereochemistry = None
+        if rdatom.HasProp("_CIPCode"):
+            stereo_code = rdatom.GetProp("_CIPCode")
+            if stereo_code == "R":
+                stereochemistry = "R"
+            elif stereo_code == "S":
+                stereochemistry = "S"
+            else:
+                raise UndefinedStereochemistryError(
+                    "In from_pdb: Expected atom stereochemistry of R or S. "
+                    f"Got {stereo_code} instead."
+                )
+        offatom.stereochemistry = stereochemistry

@@ -2,7 +2,7 @@ import itertools
 from collections.abc import Mapping
 from os import PathLike
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 
 import numpy as np
 from typing_extensions import assert_never
@@ -11,7 +11,7 @@ from openff.toolkit import Molecule, Topology
 from openff.units import elements, unit
 
 from ._pdb_data import PdbData, ResidueMatch
-from ._utils import cryst_to_box_vectors
+from ._utils import assign_stereochemistry_from_3d, cryst_to_box_vectors
 from .ccd import CCD_RESIDUE_DEFINITION_CACHE
 from .exceptions import (
     MultipleMatchingResidueDefinitionsError,
@@ -25,9 +25,11 @@ __all__ = [
 
 
 def _load_unknown_residue(
-    data: PdbData, indices: tuple[int, ...], unknown_molecules: Sequence[Molecule]
+    data: PdbData,
+    indices: tuple[int, ...],
+    unknown_molecules: Iterable[Molecule],
 ) -> Molecule | None:
-    conects = set()
+    conects: set[tuple[int, int]] = set()
     serial_to_mol_index = {}
     pdbmol = Molecule()
     for i, pdb_index in enumerate(indices):
@@ -61,8 +63,8 @@ def _load_unknown_residue(
 
     for molecule in unknown_molecules:
         (match_found, mapping) = Molecule.are_isomorphic(
-            pdbmol,
             molecule,
+            pdbmol,
             return_atom_map=True,
             aromatic_matching=False,
             formal_charge_matching=False,
@@ -72,10 +74,8 @@ def _load_unknown_residue(
             strip_pyrimidal_n_atom_stereo=True,
         )
         if match_found:
-            assert mapping is not None
-            molecule = Molecule(molecule)
-            for i, atom in enumerate(molecule.atoms):
-                pdbatom = pdbmol.atom(mapping[i])
+            molecule = molecule.remap(mapping)
+            for atom, pdbatom in zip(molecule.atoms, pdbmol.atoms):
                 atom.metadata.update(pdbatom.metadata)
                 atom.name = pdbatom.name
             molecule._conformers = None
@@ -87,11 +87,14 @@ def _load_unknown_residue(
 
 def topology_from_pdb(
     path: PathLike[str],
-    use_canonical_names: bool = False,
-    unknown_molecules: Sequence[Molecule] = [],
+    unknown_molecules: Iterable[Molecule] = [],
     residue_database: Mapping[
-        str, list[ResidueDefinition]
+        str, Iterable[ResidueDefinition]
     ] = CCD_RESIDUE_DEFINITION_CACHE,
+    additional_substructures: Iterable[ResidueDefinition] = [],
+    use_canonical_names: bool = False,
+    ignore_unknown_CONECT_records: bool = False,
+    set_stereochemistry: bool = True,
 ) -> Topology:
     """
     Load a PDB file into an OpenFF ``Topology``.
@@ -118,9 +121,6 @@ def topology_from_pdb(
     ----------
     path
         The path to the PDB file.
-    use_canonical_names
-        If ``True``, atom names in the PDB file will be replaced by the
-        canonical name for the same atom from the residue database.
     unknown_molecules
         A list of molecules to match residues not found in the
         ``residue_database`` against. Unlike ``residue_database``, this requires
@@ -131,6 +131,25 @@ def topology_from_pdb(
         default, a patched version of the CCD. Chemistry is identified by atom
         and residue names. If multiple residue definitions match a particular
         residue, the first one encountered is applied.
+    additional_substructures
+        Additional residue definitions to match against all residues that found
+        no matches in the ``residue_database``. These definitions can match
+        whether or not the residue name matches. To use this argument with
+        OpenFF ``Molecule`` objects or SMILES strings, see the
+        ``ResidueDefinition.from_*`` class methods.
+    use_canonical_names
+        If ``True``, atom names in the PDB file will be replaced by the
+        canonical name for the same atom from the residue database.
+    ignore_unknown_CONECT_records
+        CONECT records do not include chemical information such as bond order
+        and cannot be used on their own to add bonds beyond those specified
+        through the residue database and unknown molecules. By default, any
+        CONECT records not reflected in the final topology raise an error.
+        If this argument is ``True``, this error is suppressed.
+    set_stereochemistry
+        If ``True``, stereochemistry will be set according to the structure of
+        the PDB file. This takes considerable time. If ``False``, leave stereo
+        unset.
 
     Notes
     -----
@@ -189,7 +208,8 @@ def topology_from_pdb(
     prev_chain_id = data.chain_id[0]
     prev_model = data.model[0]
     for res_atom_idcs, matches in zip(
-        data.residue_indices, data.get_residue_matches(residue_database)
+        data.residue_indices,
+        data.get_residue_matches(residue_database, additional_substructures),
     ):
         # Check that we have a unique match, and error out or consult
         # unique_molecules as appropriate
@@ -260,15 +280,55 @@ def topology_from_pdb(
 
         prev_chain_id = data.chain_id[prototype_index]
         prev_model = data.model[prototype_index]
+    molecules.append(this_molecule)
 
     for offmol in molecules:
         offmol._invalidate_cached_properties()
         offmol.add_default_hierarchy_schemes()
-    molecules.append(this_molecule)
 
     topology = Topology.from_molecules(molecules)
     topology.set_positions(np.stack([data.x, data.y, data.z], axis=-1) * unit.angstrom)
 
+    if set_stereochemistry:
+        for molecule in topology.molecules:
+            # TODO: Speed this up
+            #   - Build up molecules in RDMol form to skip conversion step?
+            # This accounts for nearly half of the time to load 5ap1_prepared.pdb
+            assign_stereochemistry_from_3d(molecule)
+
+    if not ignore_unknown_CONECT_records:
+        check_all_conects(topology, data)
+
+    set_box_vectors(topology, data)
+
+    return topology
+
+
+def check_all_conects(topology: Topology, data: PdbData):
+    all_bonds: set[tuple[int, int]] = {
+        tuple(
+            sorted([topology.atom_index(bond.atom1), topology.atom_index(bond.atom2)])
+        )
+        for bond in topology.bonds
+    }  # type:ignore[assignment]
+    index_of = {serial: i for i, serial in enumerate(data.serial)}
+
+    conect_bonds: set[tuple[int, int]] = set()
+    for atom, (i_idx, js) in zip(topology.atoms, enumerate(data.conects)):
+        for j in js:
+            j_idx = index_of[j]
+            conect_bonds.add((i_idx, j_idx) if i_idx < j_idx else (j_idx, i_idx))
+    if not conect_bonds.issubset(all_bonds):
+        raise ValueError(
+            "CONECT records without chemical information not supported",
+            sorted(
+                sorted([data.serial[a], data.serial[b]])
+                for a, b in conect_bonds.difference(all_bonds)
+            ),
+        )
+
+
+def set_box_vectors(topology: Topology, data: PdbData):
     if (
         data.cryst1_a is not None
         and data.cryst1_b is not None
@@ -286,8 +346,6 @@ def topology_from_pdb(
             data.cryst1_gamma,
         )
 
-    return topology
-
 
 def add_to_molecule(
     this_molecule: Molecule,
@@ -296,8 +354,20 @@ def add_to_molecule(
     data: PdbData,
     use_canonical_names: bool,
 ) -> None:
+    # Identify the previous linking atom
+    linking_atom_idx: None | int = None
+    if residue_match.expect_prior_bond:
+        linking_atom_name = residue_match.residue_definition.linking_bond.atom1
+        for i in reversed(range(this_molecule.n_atoms)):
+            if this_molecule.atom(i).metadata["canonical_name"] == linking_atom_name:
+                linking_atom_idx = i
+                break
+        assert (
+            linking_atom_idx is not None
+        ), "Expecting a prior bond, but no linking atom found"
+
     # Add the residue to the current molecule
-    atom_name_to_mol_idx = {}
+    atom_name_to_mol_idx: dict[str, int] = {}
     for pdb_index in res_atom_idcs:
         atom_def = residue_match.atom(pdb_index)
 
@@ -309,7 +379,7 @@ def add_to_molecule(
             atomic_number=elements.NUMBERS[atom_def.symbol],
             formal_charge=atom_def.charge,
             is_aromatic=atom_def.aromatic,
-            stereochemistry=atom_def.stereo,
+            stereochemistry=None,
             name=atom_def.name if use_canonical_names else data.name[pdb_index],
             metadata={
                 "residue_name": data.res_name[pdb_index],
@@ -331,13 +401,24 @@ def add_to_molecule(
     for bond in residue_match.residue_definition.bonds:
         if bond.atom1 in atom_name_to_mol_idx and bond.atom2 in atom_name_to_mol_idx:
             this_molecule._add_bond(
-                # TODO: Fix
                 atom1=atom_name_to_mol_idx[bond.atom1],
                 atom2=atom_name_to_mol_idx[bond.atom2],
                 bond_order=bond.order,
                 is_aromatic=bond.aromatic,
-                stereochemistry=None,  # TODO: Calculate stereo from coords
+                stereochemistry=None,
                 invalidate_cache=False,
             )
 
-    # TODO: Add inter-residue bonds
+    if linking_atom_idx is not None:
+        linking_bond = residue_match.residue_definition.linking_bond
+        assert (
+            linking_bond is not None
+        ), "linking_atom_idx is only set when linking_atom_idx is None"
+        this_molecule._add_bond(
+            atom1=linking_atom_idx,
+            atom2=atom_name_to_mol_idx[linking_bond.atom2],
+            bond_order=linking_bond.order,
+            is_aromatic=linking_bond.aromatic,
+            stereochemistry=None,
+            invalidate_cache=False,
+        )

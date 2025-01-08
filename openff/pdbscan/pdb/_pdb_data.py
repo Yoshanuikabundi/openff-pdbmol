@@ -248,7 +248,8 @@ class PdbData:
 
     def get_residue_matches(
         self,
-        residue_database: Mapping[str, list[ResidueDefinition]],
+        residue_database: Mapping[str, Iterable[ResidueDefinition]],
+        additional_substructures: Iterable[ResidueDefinition],
     ) -> Iterator[list[ResidueMatch]]:
         all_matches: list[tuple[ResidueMatch, ...]] = []
         for res_atom_idcs in self.residue_indices:
@@ -266,9 +267,12 @@ class PdbData:
                     matches.append(match)
 
             if len(matches) == 0:
-                # TODO: Implement additional_substructures here
-                # raise NoMatchingResidueDefinitionError(res_atom_idcs, self)
-                pass
+                for residue_definition in additional_substructures:
+                    match = self.subset_matches_residue(
+                        res_atom_idcs, residue_definition
+                    )
+                    if match is not None:
+                        matches.append(match)
 
             all_matches.append(tuple(matches))
 
