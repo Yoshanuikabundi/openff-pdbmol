@@ -3,24 +3,27 @@ channels:
   - conda-forge
 dependencies:
   # Base depends
-  - python
+  - python>=3.10
   - pip
 
   # Documentation
-  - myst-parser>=1,<2
-  - sphinx>=5.3,<7
+  - myst-parser
+  - sphinx==6.1.2
   - sphinx-notfound-page
   - autodoc-pydantic
   - sphinx-click
 
   # Imports
   - openff-units
+  - openff-toolkit
   - polars
   - openmm
   - mdtraj
   - numpy
   - nglview
   - typer>=0.14
+  - mdanalysis
+  - rdkit
 
   #  Pip-only installs
   - pip:
